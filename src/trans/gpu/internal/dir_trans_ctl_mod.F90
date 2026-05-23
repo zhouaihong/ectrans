@@ -74,7 +74,8 @@ CONTAINS
     !     ------------------------------------------------------------------
 
     USE PARKIND_ECTRANS,        ONLY: JPRBT, JPRD, JPRB, JPIM
-    USE TPM_GEN,                ONLY: NPROMATR
+    USE TPM_GEN,                ONLY: NPROMATR, NOUT, NPRINTLEV
+    USE TPM_DISTR,              ONLY: MYPROC
     USE TPM_TRANS,              ONLY: GROWING_ALLOCATION
     USE BUFFERED_ALLOCATOR_MOD, ONLY: BUFFERED_ALLOCATOR, MAKE_BUFFERED_ALLOCATOR, &
       &                               INSTANTIATE_ALLOCATOR
@@ -128,6 +129,10 @@ CONTAINS
     TYPE(TRLTOM_HANDLE) :: HTRLTOM
     TYPE(TRLTOM_UNPACK_HANDLE) :: HTRLTOM_UNPACK
     TYPE(LTDIR_HANDLE) :: HLTDIR
+    ! 260420 wrqt begin
+    ! 260420 wrqt comment仅在首个调用时输出，避免重复刷屏
+    LOGICAL,SAVE :: LREPORTED = .FALSE.
+    ! 260420 wrqt end
 
     IF (NPROMATR > 0) THEN
       CALL ABORT_TRANS("NPROMATR > 0 not supported for GPU")
@@ -145,6 +150,15 @@ CONTAINS
     ENDIF
 
     CALL INSTANTIATE_ALLOCATOR(ALLOCATOR, GROWING_ALLOCATION)
+
+    ! 260420 wrqt begin
+    ! 260420 wrqt comment输出GPU直接变换控制层收到的关键尺寸，便于核对外层传参与控制层是否一致
+    IF (NPRINTLEV > 0 .AND. MYPROC == 1 .AND. .NOT. LREPORTED) THEN
+      WRITE(NOUT,'(A,6(I0,1X))') 'TRACE GPU DIR_TRANS_CTL: KF_UV_G KF_SCALARS_G KF_GP KF_FS KF_UV KF_SCALARS = ', &
+        & KF_UV_G, KF_SCALARS_G, KF_GP, KF_FS, KF_UV, KF_SCALARS
+      LREPORTED = .TRUE.
+    ENDIF
+    ! 260420 wrqt end
 
     ! from the PGP arrays to PREEL_REAL
     CALL GSTATS(158,0)
