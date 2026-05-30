@@ -1843,6 +1843,16 @@ subroutine gstats_labels
   call gstats_label(153, '   ', 'LTDIR_CTL      - L to M transposition')
   call gstats_label(157, '   ', 'FTINV_CTL      - L to G transposition')
   call gstats_label(158, '   ', 'FTDIR_CTL      - G to L transposition')
+  call gstats_label(421, '   ', 'TRANS          - MPI/update exchange')
+  call gstats_label(422, '   ', 'TRANS          - Finalize/update host')
+  call gstats_label(440, '   ', 'TRANS          - Pre-MPI barrier')
+  call gstats_label(441, '   ', 'TRANS          - Post-MPI barrier')
+  call gstats_label(442, '   ', 'TRANS          - Final barrier')
+  call gstats_label(805, '   ', 'TRLTOG         - Remote exchange total')
+  call gstats_label(1604, '   ', 'TRLTOG         - Local self copy')
+  call gstats_label(1605, '   ', 'TRLTOG         - Pack send buffer')
+  call gstats_label(1606, '   ', 'TRLTOG         - Unpack/finalize total')
+  call gstats_label(1806, '   ', 'TRLTOG         - Setup/index/data region')
   call gstats_label(400, '   ', 'GSTATS         - GSTATS itself')
 
 end subroutine gstats_labels
