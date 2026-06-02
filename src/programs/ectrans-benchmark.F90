@@ -635,14 +635,12 @@ do jstep = 1, iters+iters_warmup
 
   ztstep1(jstep) = timef()
   call gstats(4,0)
-#ifdef _OPENACC
-  call set_trltog_update_host(ldump_checksums .or. ldump_values)
-#endif
   if (icall_mode == 1) then
     call inv_trans(pspvor=zspvor, pspdiv=zspdiv, pspscalar=zspscalar, pgp=zgp, &
       &            kvsetuv=ivset, kvsetsc=ivsetsc, &
       &            ldscders=lscders, ldvorgp=lvordiv, lddivgp=lvordiv, lduvder=luvder, &
-      &            kproma=nproma)
+      &            kproma=nproma, &
+      &            ldupdate_host=(ldump_checksums .or. ldump_values))
 
     if (ldump_checksums) then
       ! Remove trash at end of last block
@@ -656,7 +654,8 @@ do jstep = 1, iters+iters_warmup
     call inv_trans(pspvor=zspvor, pspdiv=zspdiv, pspsc3a=zspsc3a, pspsc2=zspsc2, pgpuv=zgpuv, &
       &            pgp3a=zgp3a, pgp2=zgp2, &
       &            kvsetuv=ivset, kvsetsc2=ivsetsc2, kvsetsc3a=ivset, &
-      &            ldscders=lscders, ldvorgp=lvordiv, lddivgp=lvordiv, lduvder=luvder, kproma=nproma)
+      &            ldscders=lscders, ldvorgp=lvordiv, lddivgp=lvordiv, lduvder=luvder, kproma=nproma, &
+      &            ldupdate_host=(ldump_checksums .or. ldump_values))
 
     if (ldump_checksums) then
       ! Remove trash at end of last block
@@ -704,7 +703,6 @@ do jstep = 1, iters+iters_warmup
 
 #ifdef _OPENACC
   call set_trgtol_update_device(ldump_checksums .or. ldump_values)
-  call set_trltog_update_host(.true.)
 #endif
 
   !=================================================================================================
