@@ -26,10 +26,6 @@ use oml_mod ,only : oml_max_threads
 use mpl_module
 use yomgstats, only: jpmaxstat, gstats_lstats => lstats
 use yomhook, only : dr_hook_init
-#ifdef _OPENACC
-use trltog_mod, only: set_trltog_update_host
-#endif
-
 use ectrans_memory, only : allocator
 #ifdef _OPENACC
 ! 260419 wrqt begin
