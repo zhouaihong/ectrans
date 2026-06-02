@@ -703,6 +703,7 @@ do jstep = 1, iters+iters_warmup
   endif
 
 #ifdef _OPENACC
+  call set_trgtol_update_device(ldump_checksums .or. ldump_values)
   call set_trltog_update_host(.true.)
 #endif
 
@@ -739,6 +740,9 @@ do jstep = 1, iters+iters_warmup
 
   endif
   call gstats(5,1)
+#ifdef _OPENACC
+  call set_trgtol_update_device(.true.)
+#endif
 
   ztstep2(jstep) = (timef() - ztstep2(jstep))/1000.0_jprd
 
@@ -1861,6 +1865,12 @@ subroutine gstats_labels
   call gstats_label(432, '   ', 'TRLTOG         - Update host PGP3B')
   call gstats_label(433, '   ', 'TRLTOG         - Update host ZCOMBUFS')
   call gstats_label(434, '   ', 'TRLTOG         - Update device ZCOMBUFR')
+  call gstats_label(450, "   " , "TRGTOL         - Update device total")
+  call gstats_label(451, "   " , "TRGTOL         - Update device PGP")
+  call gstats_label(452, "   " , "TRGTOL         - Update device PGPUV")
+  call gstats_label(453, "   " , "TRGTOL         - Update device PGP2")
+  call gstats_label(454, "   " , "TRGTOL         - Update device PGP3A")
+  call gstats_label(455, "   " , "TRGTOL         - Update device PGP3B")
   call gstats_label(440, '   ', 'TRANS          - Pre-MPI barrier')
   call gstats_label(441, '   ', 'TRANS          - Post-MPI barrier')
   call gstats_label(442, '   ', 'TRANS          - Final barrier')
