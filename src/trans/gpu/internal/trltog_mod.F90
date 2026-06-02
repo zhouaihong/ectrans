@@ -759,6 +759,7 @@ CONTAINS
     !$ACC HOST_DATA USE_DEVICE(ZCOMBUFS,ZCOMBUFR)
 #endif
 #else
+    CALL GSTATS(433,0)
 #ifdef OMPGPU
     !$OMP TARGET UPDATE FROM(ZCOMBUFS) IF(ISEND_COUNTS > 0)
 #endif
@@ -766,6 +767,7 @@ CONTAINS
     !! this is safe-but-slow fallback for running without GPU-aware MPI
     !$ACC UPDATE HOST(ZCOMBUFS) IF(ISEND_COUNTS > 0)
 #endif
+    CALL GSTATS(433,1)
 #endif
 
     ! Skip the own contribution because this is ok to overflow
@@ -823,12 +825,14 @@ CONTAINS
 #ifdef OMPGPU
 #endif
     !! this is safe-but-slow fallback for running without GPU-aware MPI
+    CALL GSTATS(434,0)
 #ifdef OMPGPU
     !$OMP TARGET UPDATE TO(ZCOMBUFR) IF(IRECV_COUNTS > 0)
 #endif
 #ifdef ACCGPU
     !$ACC UPDATE DEVICE(ZCOMBUFR) IF(IRECV_COUNTS > 0)
 #endif
+    CALL GSTATS(434,1)
 #endif
 
     IF (LSYNC_TRANS) THEN
@@ -977,28 +981,34 @@ CONTAINS
     ENDIF
     CALL GSTATS(428,0)
     IF (PRESENT(PGP2)) THEN
+      CALL GSTATS(430,0)
 #ifdef OMPGPU
       !$OMP TARGET UPDATE FROM(PGP2)
 #endif
 #ifdef ACCGPU
       !$ACC UPDATE HOST(PGP2) ASYNC(1)
 #endif
+      CALL GSTATS(430,1)
     ENDIF
     IF (PRESENT(PGP3A)) THEN
+      CALL GSTATS(431,0)
 #ifdef OMPGPU
       !$OMP TARGET UPDATE FROM(PGP3A)
 #endif
 #ifdef ACCGPU
       !$ACC UPDATE HOST(PGP3A) ASYNC(1)
 #endif
+      CALL GSTATS(431,1)
     ENDIF
     IF (PRESENT(PGP3B)) THEN
+      CALL GSTATS(432,0)
 #ifdef OMPGPU
       !$OMP TARGET UPDATE FROM(PGP3B)
 #endif
 #ifdef ACCGPU
       !$ACC UPDATE HOST(PGP3B) ASYNC(1)
 #endif
+      CALL GSTATS(432,1)
     ENDIF
     CALL GSTATS(428,1)
     CALL GSTATS(429,0)
