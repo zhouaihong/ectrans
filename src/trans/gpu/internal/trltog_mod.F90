@@ -436,6 +436,7 @@ CONTAINS
 
     ! Prepare receiver arrays
     ! find number of fields on a certain V-set
+    CALL GSTATS(1810,0)
     IF(NPRTRV == 1) THEN
       ! This is needed because KVSET(JFLD) == -1 if there is only one V-set
       IRECV_FIELD_COUNT(1) = KF_GP
@@ -462,8 +463,10 @@ CONTAINS
       ! total recv size is # points per field * # fields
       IRECVTOT(JROC) = 1_JPIB*IRECV_WSET_SIZE(ISETW)*IRECV_FIELD_COUNT(ISETV)
     ENDDO
+    CALL GSTATS(1810,1)
 
     ! Prepare sender arrays
+    CALL GSTATS(1811,0)
     IIN_TO_SEND_BUFR_OFFSET(1) = 0
     DO JROC=1,NPROC
       ! Get new offset to my current KINDEX entry
@@ -502,14 +505,18 @@ CONTAINS
       ISENDTOT(JROC) = IPOS*KF_FS
     ENDDO
     LLOCAL_CONTRIBUTION = ISENDTOT(MYPROC) > 0
+    CALL GSTATS(1811,1)
 
 #ifdef OMPGPU
     !$OMP TARGET DATA MAP(TO:IGP_OFFSETS)
 #endif
 #ifdef ACCGPU
+    CALL GSTATS(1812,0)
     !$ACC DATA COPYIN(IGP_OFFSETS) ASYNC(1)
+    CALL GSTATS(1812,1)
 #endif
 
+    CALL GSTATS(1813,0)
     ACC_POINTERS_CNT = 0
     IF (PRESENT(PGP)) THEN
       ACC_POINTERS_CNT = ACC_POINTERS_CNT + 1
@@ -539,6 +546,7 @@ CONTAINS
 #ifdef OMPGPU
          & STREAM=1)
 #endif
+    CALL GSTATS(1813,1)
 
 #ifdef OMPGPU
     !$OMP TARGET DATA MAP(PRESENT,ALLOC:PGP) IF(PRESENT(PGP))
@@ -550,6 +558,7 @@ CONTAINS
     !$OMP TARGET DATA MAP(TO:IIN_TO_SEND_BUFR) MAP(PRESENT,ALLOC:PREEL_REAL) IF(KF_FS > 0)
 #endif
 #ifdef ACCGPU
+    CALL GSTATS(1814,0)
     !$ACC DATA IF(PRESENT(PGP))   PRESENT(PGP) ASYNC(1)
     !$ACC DATA IF(PRESENT(PGPUV)) PRESENT(PGPUV) ASYNC(1)
     !$ACC DATA IF(PRESENT(PGP2))  PRESENT(PGP2) ASYNC(1)
@@ -558,11 +567,13 @@ CONTAINS
 
     ! Present until self contribution and packing are done
     !$ACC DATA COPYIN(IIN_TO_SEND_BUFR) PRESENT(PREEL_REAL) IF(KF_FS > 0) ASYNC(1)
+    CALL GSTATS(1814,1)
 #endif
 
     CALL GSTATS(1806,1)
     
     ! Figure out processes that send or recv something
+    CALL GSTATS(1815,0)
     ISEND_COUNTS   = 0
     IRECV_COUNTS   = 0
     DO JROC=1,NPROC
@@ -617,12 +628,15 @@ CONTAINS
         ENDIF
       ENDDO
     ENDDO
+    CALL GSTATS(1815,1)
    
 #ifdef OMPGPU
     !$OMP TARGET DATA MAP(TO:IFLDA)
 #endif
 #ifdef ACCGPU
+    CALL GSTATS(1816,0)
     !$ACC DATA COPYIN(IFLDA) ASYNC(1)
+    CALL GSTATS(1816,1)
 #endif
 
     ! Copy local contribution
@@ -634,6 +648,7 @@ CONTAINS
       IRECV_WSET_SIZE_V = IRECV_WSET_SIZE(MYSETW)
       IIN_TO_SEND_BUFR_V = IIN_TO_SEND_BUFR_OFFSET(MYPROC)
       IF (PRESENT(PGP)) THEN
+        CALL GSTATS(1607,0)
 #ifdef OMPGPU
         !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) DEFAULT(NONE) &
         !$OMP& PRIVATE(JK,JBLK,IFLD,IPOS) &
@@ -656,7 +671,9 @@ CONTAINS
             PGP(JK,IFLD,JBLK) = PREEL_REAL(IPOS)
           ENDDO
         ENDDO
+        CALL GSTATS(1607,1)
       ELSE
+        CALL GSTATS(1608,0)
 #ifdef OMPGPU
         !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) DEFAULT(NONE) &
         !$OMP& PRIVATE(JK,JBLK,IFLD,IPOS) &
@@ -687,10 +704,12 @@ CONTAINS
             ENDIF
           ENDDO
         ENDDO
+        CALL GSTATS(1608,1)
       ENDIF
       CALL GSTATS(1604,1)
     ENDIF
 
+    CALL GSTATS(1817,0)
     ALLOCATE(ICOMBUFS_OFFSET(ISEND_COUNTS+1))
     ICOMBUFS_OFFSET(1) = 0
     DO JROC=1,ISEND_COUNTS
@@ -711,6 +730,7 @@ CONTAINS
           & ALIGN(1_JPIB*KF_GP*D%NGPTOT*C_SIZEOF(ZCOMBUFR(1)),128)+1, &
           & ICOMBUFS_OFFSET(ISEND_COUNTS+1)*C_SIZEOF(ZCOMBUFS(1)))
     ENDIF
+    CALL GSTATS(1817,1)
 
 #ifdef OMPGPU
     !$OMP TARGET DATA MAP(PRESENT,ALLOC:ZCOMBUFS) IF(ISEND_COUNTS > 0)
@@ -784,6 +804,7 @@ CONTAINS
 #endif
 
     ! Skip the own contribution because this is ok to overflow
+    CALL GSTATS(809,0)
     ISENDTOT(MYPROC) = 0
     IRECVTOT(MYPROC) = 0
 
@@ -793,7 +814,9 @@ CONTAINS
       & CALL MPL_ABORT("Overflow in trltog")
     IF (ANY(IRECVTOT_MPI /= IRECVTOT)) &
       & CALL MPL_ABORT("Overflow in trltog")
+    CALL GSTATS(809,1)
 
+    CALL GSTATS(806,0)
     DO INR=1,IRECV_COUNTS
       IR=IR+1
       IRECV=IRECV_TO_PROC(INR)
@@ -808,8 +831,10 @@ CONTAINS
       CALL ABORT_TRANS("Should not be here: MPI is disabled")
 #endif
     ENDDO
+    CALL GSTATS(806,1)
 
     !...Send loop.........................................................
+    CALL GSTATS(807,0)
     DO INS=1,ISEND_COUNTS
       IR=IR+1
       ISEND=ISEND_TO_PROC(INS)
@@ -821,10 +846,13 @@ CONTAINS
         CALL ABORT_TRANS("Should not be here: MPI is disabled")
 #endif
     ENDDO
+    CALL GSTATS(807,1)
 
     IF(IR > 0) THEN
+      CALL GSTATS(808,0)
       CALL MPL_WAIT(KREQUEST=IREQ(1:IR), &
       & CDSTRING='TRLTOG: WAIT FOR SENDS AND RECEIVES')
+      CALL GSTATS(808,1)
     ENDIF
 
 #ifdef USE_GPU_AWARE_MPI
@@ -866,6 +894,7 @@ CONTAINS
     !  Unpack loop.........................................................
 
     CALL GSTATS(1606,0)
+    CALL GSTATS(1609,0)
     DO INR=1,IRECV_COUNTS
       IRECV=IRECV_TO_PROC(INR)
       CALL PE2SET(IRECV,ISETA,ISETB,ISETW,ISETV)
@@ -936,13 +965,16 @@ CONTAINS
 #ifdef ACCGPU
     !$ACC WAIT(1)
 #endif
+    CALL GSTATS(1609,1)
 
+    CALL GSTATS(1610,0)
 #ifdef OMPGPU
     !$OMP END TARGET DATA ! ZCOMBUFR
 #endif
 #ifdef ACCGPU
     !$ACC END DATA ! ZCOMBUFR
 #endif
+    CALL GSTATS(1610,1)
     IF (LSYNC_TRANS) THEN
 #ifdef ACCGPU
       !$ACC WAIT(1)
@@ -1049,9 +1081,11 @@ CONTAINS
     CALL GSTATS(422,1)
 
 #ifdef ACCGPU
+    CALL GSTATS(1611,0)
     !$ACC END DATA ! IGP_OFFSETS
 
     !$ACC WAIT(1)
+    CALL GSTATS(1611,1)
 #endif
 #ifdef OMPGPU
     !$OMP END TARGET DATA !IGP_OFFSETS
