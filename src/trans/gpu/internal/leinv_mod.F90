@@ -197,6 +197,7 @@ CONTAINS
     !    DO=1,7/2+1 ... 1..4
     !       PIA_2=2+1+(1..4-1)*2 ...3+(0..3)*2 .... 3,5,7,9
 
+    CALL GSTATS(470,0)
 #ifdef OMPGPU
     ! Directive incomplete -> putting more variables in SHARED() triggers internal compiler error
     ! ftn-7991: INTERNAL COMPILER ERROR:  "Too few arguments on the stack"
@@ -213,7 +214,6 @@ CONTAINS
     !$ACC& ASYNC(1)
 #endif
 #endif
-    CALL GSTATS(470,0)
     DO KMLOC=1,D_NUMP
       DO JK=1,2*KF_LEG
         KM =  D_MYMS(KMLOC)
@@ -348,6 +348,7 @@ CONTAINS
     !    DO=1,5
     !       PIA_2=1+1+(1..5-1)*2 ...2+(0..4)*2 .... 2,4,6,8,10
 
+    CALL GSTATS(472,0)
 #ifdef OMPGPU
     ! Directive incomplete -> putting more variables in SHARED() triggers internal compiler error
     ! ftn-7991: INTERNAL COMPILER ERROR:  "Too few arguments on the stack"
@@ -364,7 +365,6 @@ CONTAINS
     !$ACC&
 #endif
 #endif
-    CALL GSTATS(472,0)
     DO KMLOC=1,D_NUMP
       DO JK=1,2*KF_LEG
         KM =  D_MYMS(KMLOC)
