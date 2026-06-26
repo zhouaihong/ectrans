@@ -40,7 +40,7 @@ CONTAINS
 
     TYPE(LTINV_HANDLE) :: HLTINV
 
-    INTEGER(KIND=JPIB) :: IALLOC_SZ, IPIA_SZ
+    INTEGER(KIND=JPIB) :: IALLOC_SZ
     INTEGER(KIND=JPIM)  :: IOUT_STRIDES0
     INTEGER(KIND=JPIB)  :: IOUT_SIZE
     INTEGER(KIND=JPIM)  :: IOUT0_STRIDES0, IOUT0_SIZE
@@ -65,8 +65,6 @@ CONTAINS
     IF (LSCDERS) &
       IF_READIN = IF_READIN + KF_SCALARS ! Scalars NS Derivatives
 
-    IPIA_SZ = ALIGN(2_JPIB*IF_READIN*(R%NSMAX+3)*D%NUMP*C_SIZEOF(ZPRBT_DUMMY),128)
-
     ! In Legendre space, we then ignore vorticity/divergence, if
     ! they don't need to be transformed.
     IF_LEG = IF_READIN
@@ -76,8 +74,7 @@ CONTAINS
     CALL LEINV_STRIDES(IF_LEG,IOUT_STRIDES0,IOUT_SIZE,IIN_STRIDES0,IIN_SIZE,&
                        IOUT0_STRIDES0,IOUT0_SIZE,IIN0_STRIDES0,IIN0_SIZE)
 
-    ! PIA
-    IALLOC_SZ = IPIA_SZ
+    IALLOC_SZ = 0
     ! ZINP
     IALLOC_SZ = IALLOC_SZ + ALIGN(IIN_SIZE*C_SIZEOF(ZPRBT_DUMMY),128)
     ! ZINP0
@@ -107,19 +104,17 @@ CONTAINS
     USE YOMHOOK,                ONLY: LHOOK, DR_HOOK, JPHOOK
     USE TPM_DIM,                ONLY: R
     USE TPM_TRANS,              ONLY: LDIVGP, LVORGP, NF_SC2, NF_SC3A, NF_SC3B, LSCDERS
-    USE TPM_GEOMETRY,           ONLY: G
     USE BUFFERED_ALLOCATOR_MOD, ONLY: BUFFERED_ALLOCATOR, ASSIGN_PTR, GET_ALLOCATION
     USE TPM_DISTR,              ONLY: D
-    USE PRFI1B_MOD,             ONLY: PRFI1B
-    USE VDTUV_MOD,              ONLY: VDTUV
-    USE SPNSDE_MOD,             ONLY: SPNSDE
-    USE LEINV_MOD,              ONLY: LEINV_STRIDES, LEINV
+    USE LTINV_PACK_MOD,         ONLY: LTINV_PACK_SPEC, LTINV_PACK_UV, LTINV_PACK_NSDER, &
+     &                                LTINV_ZERO_PACK_PADDING
+    USE LEINV_MOD,              ONLY: LEINV_STRIDES, LEINV_GEMM_ANTISYM, LEINV_GEMM_SYM
     USE ABORT_TRANS_MOD,        ONLY: ABORT_TRANS
     USE TPM_FIELDS_GPU,         ONLY: FG
     USE MPL_MODULE,             ONLY: MPL_BARRIER,MPL_ALL_MS_COMM
     USE TPM_GEN,                ONLY: LSYNC_TRANS
     USE TPM_STATS,              ONLY: GSTATS => GSTATS_NVTX
-    USE ISO_C_BINDING,          ONLY: C_LOC, C_SIZEOF, C_F_POINTER
+    USE ISO_C_BINDING,          ONLY: C_SIZEOF
 
     !**** *LTINV* - Inverse Legendre transform
     !
@@ -150,10 +145,8 @@ CONTAINS
     !     ----------
 
     !         PREPSNM - prepare REPSNM for wavenumber KM
-    !         PRFI1B  - prepares the spectral fields
-    !         VDTUV   - compute u and v from vorticity and divergence
-    !         SPNSDE  - compute north-south derivatives
-    !         LEINV   - Inverse Legendre transform
+    !         LTINV_PACK_* - prepare packed Legendre inputs
+    !         LEINV_GEMM_* - inverse Legendre GEMM
 
     !     Reference.
     !     ----------
@@ -186,10 +179,6 @@ CONTAINS
 
     INTEGER(KIND=JPIM) :: IFIRST, J3
 
-    REAL(KIND=JPRB), POINTER :: PIA_L(:), PIA(:,:,:)
-    REAL(KIND=JPRB), POINTER :: PU(:,:,:), PV(:,:,:), PVOR(:,:,:), PDIV(:,:,:)
-    REAL(KIND=JPRB), POINTER :: PSCALARS(:,:,:), PSCALARS_NSDER(:,:,:)
-
     REAL(KIND=JPHOOK) :: ZHOOK_HANDLE
     TYPE(BUFFERED_ALLOCATOR), INTENT(IN) :: ALLOCATOR
     TYPE(LTINV_HANDLE), INTENT(IN) :: HLTINV
@@ -202,6 +191,7 @@ CONTAINS
     INTEGER(KIND=JPIM)  :: IIN0_STRIDES0, IIN0_SIZE
 
     INTEGER(KIND=JPIM) :: IF_READIN, IF_LEG
+    INTEGER(KIND=JPIM) :: ISCALAR_OFFSET, IDER_OFFSET, ISCALAR_COUNT
     INTEGER(KIND=JPIB) :: IALLOC_POS, IALLOC_SZ
 
     REAL(KIND=JPRBT), POINTER :: ZINP(:)
@@ -236,13 +226,6 @@ CONTAINS
                        IOUT0_STRIDES0,IOUT0_SIZE,IIN0_STRIDES0,IIN0_SIZE)
 
     IALLOC_POS = 1
-
-    ! PIA
-    IALLOC_SZ = ALIGN(2_JPIB*IF_READIN*(R%NTMAX+3)*D%NUMP*C_SIZEOF(PIA_L(1)),128)
-    CALL ASSIGN_PTR(PIA_L, GET_ALLOCATION(ALLOCATOR, HLTINV%HPIA_AND_IN),&
-        & IALLOC_POS, IALLOC_SZ)
-    CALL C_F_POINTER(C_LOC(PIA_L), PIA, (/ 2*IF_READIN, R%NTMAX+3, D%NUMP /))
-    IALLOC_POS = IALLOC_POS + IALLOC_SZ
 
     ! ZINP
     IALLOC_SZ = ALIGN(IIN_SIZE*C_SIZEOF(ZINP(1)),128)
@@ -282,35 +265,6 @@ CONTAINS
         & IALLOC_POS, IALLOC_SZ)
     IALLOC_POS = IALLOC_POS + IALLOC_SZ
 
-    ! Assign pointers do the different components of PIA
-    IFIRST = 0
-    IF (.NOT. LVORGP .OR. LDIVGP) THEN
-      ! Usually we want to store vorticity first
-      PVOR => PIA(IFIRST+1:IFIRST+2*KF_UV,:,:)
-      IFIRST = IFIRST + 2*KF_UV ! Vorticity
-
-      PDIV => PIA(IFIRST+1:IFIRST+2*KF_UV,:,:)
-      IFIRST = IFIRST + 2*KF_UV ! Divergence
-    ELSE
-      ! Except if we want to translate Vorticity but not Divergence, we should have Divergence first
-      ! Then we have all buffers that move on in a contiguous buffer
-      PDIV => PIA(IFIRST+1:IFIRST+2*KF_UV,:,:)
-      IFIRST = IFIRST + 2*KF_UV ! Divergence
-
-      PVOR => PIA(IFIRST+1:IFIRST+2*KF_UV,:,:)
-      IFIRST = IFIRST + 2*KF_UV ! Vorticity
-    ENDIF
-    PU => PIA(IFIRST+1:IFIRST+2*KF_UV,:,:)
-    IFIRST = IFIRST + 2*KF_UV ! U
-    PV => PIA(IFIRST+1:IFIRST+2*KF_UV,:,:)
-    IFIRST = IFIRST + 2*KF_UV ! V
-    PSCALARS => PIA(IFIRST+1:IFIRST+2*KF_SCALARS,:,:)
-    IFIRST = IFIRST + 2*KF_SCALARS ! Scalars
-    IF (LSCDERS) THEN
-      PSCALARS_NSDER => PIA(IFIRST+1:IFIRST+2*KF_SCALARS,:,:)
-      IFIRST = IFIRST + 2*KF_SCALARS ! Scalars NS Derivatives
-    ENDIF
-
     !     ------------------------------------------------------------------
 
 
@@ -344,46 +298,189 @@ CONTAINS
     ENDIF
     CALL GSTATS(422,1)
 
-    IF (KF_UV > 0) THEN
-      CALL PRFI1B(PVOR,PSPVOR,KF_UV,UBOUND(PSPVOR,2))
-      CALL PRFI1B(PDIV,PSPDIV,KF_UV,UBOUND(PSPDIV,2))
-
-      ! Compute U and V for VOR and DIV
-      CALL VDTUV(KF_UV,ZEPSNM,PVOR,PDIV,PU,PV)
+    CALL GSTATS(470,0)
+    IFIRST = 0
+    IF (KF_UV > 0 .AND. LVORGP) THEN
+      CALL LTINV_PACK_SPEC(ZINP,ZINP0,PSPVOR,KF_UV,IFIRST,.TRUE.,&
+                         & IIN_STRIDES0,IIN0_STRIDES0)
+      IFIRST = IFIRST + KF_UV
     ENDIF
-
+    IF (KF_UV > 0 .AND. LDIVGP) THEN
+      CALL LTINV_PACK_SPEC(ZINP,ZINP0,PSPDIV,KF_UV,IFIRST,.TRUE.,&
+                         & IIN_STRIDES0,IIN0_STRIDES0)
+      IFIRST = IFIRST + KF_UV
+    ENDIF
+    IF (KF_UV > 0) THEN
+      CALL LTINV_PACK_UV(ZINP,ZINP0,PSPVOR,PSPDIV,KF_UV,IFIRST,IFIRST+KF_UV,&
+                       & .TRUE.,ZEPSNM,IIN_STRIDES0,IIN0_STRIDES0)
+      IFIRST = IFIRST + 2*KF_UV
+    ENDIF
     IF (KF_SCALARS > 0) THEN
+      ISCALAR_OFFSET = IFIRST
+      IDER_OFFSET = ISCALAR_OFFSET + KF_SCALARS
+      ISCALAR_COUNT = 0
       IF(PRESENT(PSPSCALAR)) THEN
-        CALL PRFI1B(PSCALARS,PSPSCALAR,KF_SCALARS,UBOUND(PSPSCALAR,2))
+        CALL LTINV_PACK_SPEC(ZINP,ZINP0,PSPSCALAR,KF_SCALARS,ISCALAR_OFFSET,.TRUE.,&
+                           & IIN_STRIDES0,IIN0_STRIDES0)
+        IF (LSCDERS) THEN
+          CALL LTINV_PACK_NSDER(ZINP,ZINP0,PSPSCALAR,KF_SCALARS,IDER_OFFSET,.TRUE.,&
+                              & ZEPSNM,IIN_STRIDES0,IIN0_STRIDES0)
+        ENDIF
+        ISCALAR_COUNT = KF_SCALARS
       ELSE
-        IFIRST = 1
         IF(PRESENT(PSPSC2) .AND. NF_SC2 > 0) THEN
-          CALL PRFI1B(PSCALARS(IFIRST:IFIRST+2*NF_SC2-1,:,:),PSPSC2(:,:),NF_SC2,UBOUND(PSPSC2,2))
-          IFIRST  = IFIRST+2*NF_SC2
+          CALL LTINV_PACK_SPEC(ZINP,ZINP0,PSPSC2(:,:),NF_SC2,ISCALAR_OFFSET+ISCALAR_COUNT,&
+                             & .TRUE.,IIN_STRIDES0,IIN0_STRIDES0)
+          IF (LSCDERS) THEN
+            CALL LTINV_PACK_NSDER(ZINP,ZINP0,PSPSC2(:,:),NF_SC2,IDER_OFFSET+ISCALAR_COUNT,&
+                                & .TRUE.,ZEPSNM,IIN_STRIDES0,IIN0_STRIDES0)
+          ENDIF
+          ISCALAR_COUNT = ISCALAR_COUNT + NF_SC2
         ENDIF
         IF(PRESENT(PSPSC3A) .AND. NF_SC3A > 0) THEN
           DO J3=1,UBOUND(PSPSC3A,3)
-            CALL PRFI1B(PSCALARS(IFIRST:IFIRST+2*NF_SC3A-1,:,:),PSPSC3A(:,:,J3),NF_SC3A,UBOUND(PSPSC3A,2))
-            IFIRST  = IFIRST+2*NF_SC3A
+            CALL LTINV_PACK_SPEC(ZINP,ZINP0,PSPSC3A(:,:,J3),NF_SC3A,&
+                               & ISCALAR_OFFSET+ISCALAR_COUNT,.TRUE.,&
+                               & IIN_STRIDES0,IIN0_STRIDES0)
+            IF (LSCDERS) THEN
+              CALL LTINV_PACK_NSDER(ZINP,ZINP0,PSPSC3A(:,:,J3),NF_SC3A,&
+                                  & IDER_OFFSET+ISCALAR_COUNT,.TRUE.,&
+                                  & ZEPSNM,IIN_STRIDES0,IIN0_STRIDES0)
+            ENDIF
+            ISCALAR_COUNT = ISCALAR_COUNT + NF_SC3A
           ENDDO
         ENDIF
         IF(PRESENT(PSPSC3B) .AND. NF_SC3B > 0) THEN
           DO J3=1,UBOUND(PSPSC3B,3)
-            CALL PRFI1B(PSCALARS(IFIRST:IFIRST+2*NF_SC3B-1,:,:),PSPSC3B(:,:,J3),NF_SC3B,UBOUND(PSPSC3B,2))
-            IFIRST  = IFIRST+2*NF_SC3B
+            CALL LTINV_PACK_SPEC(ZINP,ZINP0,PSPSC3B(:,:,J3),NF_SC3B,&
+                               & ISCALAR_OFFSET+ISCALAR_COUNT,.TRUE.,&
+                               & IIN_STRIDES0,IIN0_STRIDES0)
+            IF (LSCDERS) THEN
+              CALL LTINV_PACK_NSDER(ZINP,ZINP0,PSPSC3B(:,:,J3),NF_SC3B,&
+                                  & IDER_OFFSET+ISCALAR_COUNT,.TRUE.,&
+                                  & ZEPSNM,IIN_STRIDES0,IIN0_STRIDES0)
+            ENDIF
+            ISCALAR_COUNT = ISCALAR_COUNT + NF_SC3B
           ENDDO
         ENDIF
-        IF(IFIRST-1 /= 2*KF_SCALARS) THEN
-          WRITE(0,*) 'LTINV:KF_SCALARS,IFIRST',KF_SCALARS,IFIRST
-          CALL ABORT_TRANS('LTINV_MOD:IFIRST /= 2*KF_SCALARS')
+      ENDIF
+      IF(ISCALAR_COUNT /= KF_SCALARS) THEN
+        WRITE(0,*) 'LTINV:KF_SCALARS,ISCALAR_COUNT',KF_SCALARS,ISCALAR_COUNT
+        CALL ABORT_TRANS('LTINV_MOD:ISCALAR_COUNT /= KF_SCALARS')
+      ENDIF
+      IFIRST = ISCALAR_OFFSET + KF_SCALARS
+      IF (LSCDERS) IFIRST = IFIRST + KF_SCALARS
+    ENDIF
+    IF(IFIRST /= IF_LEG) THEN
+      WRITE(0,*) 'LTINV:IF_LEG,IFIRST',IF_LEG,IFIRST
+      CALL ABORT_TRANS('LTINV_MOD:IFIRST /= IF_LEG')
+    ENDIF
+    CALL LTINV_ZERO_PACK_PADDING(ZINP,ZINP0,IF_LEG,.TRUE.,&
+                               & IIN_STRIDES0,IIN0_STRIDES0)
+    IF (LSYNC_TRANS) THEN
+#ifdef ACCGPU
+      !$ACC WAIT(1)
+#endif
+      CALL GSTATS(470,1)
+      CALL GSTATS(440,0)
+      CALL MPL_BARRIER(MPL_ALL_MS_COMM,CDSTRING='')
+      CALL GSTATS(440,1)
+    ELSE
+      CALL GSTATS(470,1)
+    ENDIF
+    CALL LEINV_GEMM_ANTISYM(ALLOCATOR,ZINP,ZINP0,ZOUTA,ZOUTA0,IF_LEG)
+
+    CALL GSTATS(472,0)
+    IFIRST = 0
+    IF (KF_UV > 0 .AND. LVORGP) THEN
+      CALL LTINV_PACK_SPEC(ZINP,ZINP0,PSPVOR,KF_UV,IFIRST,.FALSE.,&
+                         & IIN_STRIDES0,IIN0_STRIDES0)
+      IFIRST = IFIRST + KF_UV
+    ENDIF
+    IF (KF_UV > 0 .AND. LDIVGP) THEN
+      CALL LTINV_PACK_SPEC(ZINP,ZINP0,PSPDIV,KF_UV,IFIRST,.FALSE.,&
+                         & IIN_STRIDES0,IIN0_STRIDES0)
+      IFIRST = IFIRST + KF_UV
+    ENDIF
+    IF (KF_UV > 0) THEN
+      CALL LTINV_PACK_UV(ZINP,ZINP0,PSPVOR,PSPDIV,KF_UV,IFIRST,IFIRST+KF_UV,&
+                       & .FALSE.,ZEPSNM,IIN_STRIDES0,IIN0_STRIDES0)
+      IFIRST = IFIRST + 2*KF_UV
+    ENDIF
+    IF (KF_SCALARS > 0) THEN
+      ISCALAR_OFFSET = IFIRST
+      IDER_OFFSET = ISCALAR_OFFSET + KF_SCALARS
+      ISCALAR_COUNT = 0
+      IF(PRESENT(PSPSCALAR)) THEN
+        CALL LTINV_PACK_SPEC(ZINP,ZINP0,PSPSCALAR,KF_SCALARS,ISCALAR_OFFSET,.FALSE.,&
+                           & IIN_STRIDES0,IIN0_STRIDES0)
+        IF (LSCDERS) THEN
+          CALL LTINV_PACK_NSDER(ZINP,ZINP0,PSPSCALAR,KF_SCALARS,IDER_OFFSET,.FALSE.,&
+                              & ZEPSNM,IIN_STRIDES0,IIN0_STRIDES0)
+        ENDIF
+        ISCALAR_COUNT = KF_SCALARS
+      ELSE
+        IF(PRESENT(PSPSC2) .AND. NF_SC2 > 0) THEN
+          CALL LTINV_PACK_SPEC(ZINP,ZINP0,PSPSC2(:,:),NF_SC2,ISCALAR_OFFSET+ISCALAR_COUNT,&
+                             & .FALSE.,IIN_STRIDES0,IIN0_STRIDES0)
+          IF (LSCDERS) THEN
+            CALL LTINV_PACK_NSDER(ZINP,ZINP0,PSPSC2(:,:),NF_SC2,IDER_OFFSET+ISCALAR_COUNT,&
+                                & .FALSE.,ZEPSNM,IIN_STRIDES0,IIN0_STRIDES0)
+          ENDIF
+          ISCALAR_COUNT = ISCALAR_COUNT + NF_SC2
+        ENDIF
+        IF(PRESENT(PSPSC3A) .AND. NF_SC3A > 0) THEN
+          DO J3=1,UBOUND(PSPSC3A,3)
+            CALL LTINV_PACK_SPEC(ZINP,ZINP0,PSPSC3A(:,:,J3),NF_SC3A,&
+                               & ISCALAR_OFFSET+ISCALAR_COUNT,.FALSE.,&
+                               & IIN_STRIDES0,IIN0_STRIDES0)
+            IF (LSCDERS) THEN
+              CALL LTINV_PACK_NSDER(ZINP,ZINP0,PSPSC3A(:,:,J3),NF_SC3A,&
+                                  & IDER_OFFSET+ISCALAR_COUNT,.FALSE.,&
+                                  & ZEPSNM,IIN_STRIDES0,IIN0_STRIDES0)
+            ENDIF
+            ISCALAR_COUNT = ISCALAR_COUNT + NF_SC3A
+          ENDDO
+        ENDIF
+        IF(PRESENT(PSPSC3B) .AND. NF_SC3B > 0) THEN
+          DO J3=1,UBOUND(PSPSC3B,3)
+            CALL LTINV_PACK_SPEC(ZINP,ZINP0,PSPSC3B(:,:,J3),NF_SC3B,&
+                               & ISCALAR_OFFSET+ISCALAR_COUNT,.FALSE.,&
+                               & IIN_STRIDES0,IIN0_STRIDES0)
+            IF (LSCDERS) THEN
+              CALL LTINV_PACK_NSDER(ZINP,ZINP0,PSPSC3B(:,:,J3),NF_SC3B,&
+                                  & IDER_OFFSET+ISCALAR_COUNT,.FALSE.,&
+                                  & ZEPSNM,IIN_STRIDES0,IIN0_STRIDES0)
+            ENDIF
+            ISCALAR_COUNT = ISCALAR_COUNT + NF_SC3B
+          ENDDO
         ENDIF
       ENDIF
+      IF(ISCALAR_COUNT /= KF_SCALARS) THEN
+        WRITE(0,*) 'LTINV:KF_SCALARS,ISCALAR_COUNT',KF_SCALARS,ISCALAR_COUNT
+        CALL ABORT_TRANS('LTINV_MOD:ISCALAR_COUNT /= KF_SCALARS')
+      ENDIF
+      IFIRST = ISCALAR_OFFSET + KF_SCALARS
+      IF (LSCDERS) IFIRST = IFIRST + KF_SCALARS
     ENDIF
-
-    ! Compute NS derivatives if needed
-    IF (LSCDERS) THEN
-      CALL SPNSDE(KF_SCALARS,ZEPSNM,PSCALARS,PSCALARS_NSDER)
+    IF(IFIRST /= IF_LEG) THEN
+      WRITE(0,*) 'LTINV:IF_LEG,IFIRST',IF_LEG,IFIRST
+      CALL ABORT_TRANS('LTINV_MOD:IFIRST /= IF_LEG')
     ENDIF
+    CALL LTINV_ZERO_PACK_PADDING(ZINP,ZINP0,IF_LEG,.FALSE.,&
+                               & IIN_STRIDES0,IIN0_STRIDES0)
+    IF (LSYNC_TRANS) THEN
+#ifdef ACCGPU
+      !$ACC WAIT(1)
+#endif
+      CALL GSTATS(472,1)
+      CALL GSTATS(440,0)
+      CALL MPL_BARRIER(MPL_ALL_MS_COMM,CDSTRING='')
+      CALL GSTATS(440,1)
+    ELSE
+      CALL GSTATS(472,1)
+    ENDIF
+    CALL LEINV_GEMM_SYM(ALLOCATOR,ZINP,ZINP0,ZOUTS,ZOUTS0,IF_LEG)
 
 #ifdef OMPGPU
     !$OMP END TARGET DATA
@@ -393,7 +490,6 @@ CONTAINS
     !$OMP END TARGET DATA
 #endif
 #ifdef ACCGPU
-    !$ACC WAIT(1)
     !$ACC END DATA
     !$ACC END DATA
     !$ACC END DATA
@@ -401,19 +497,8 @@ CONTAINS
     !$ACC END DATA
 #endif
 
-  !     ------------------------------------------------------------------
-
-
-    !*       4.    INVERSE LEGENDRE TRANSFORM.
-    !              ---------------------------
-
-    ! Legendre transforms. When converting PIA into ZOUT, we ignore the first entries of LEINV.
-    ! This is because vorticity and divergence is not necessarily converted to GP space.
-    CALL LEINV(ALLOCATOR,PIA(2*(IF_READIN-IF_LEG)+1:IF_READIN,:,:),ZINP,ZINP0,ZOUTS,ZOUTA,ZOUTS0,ZOUTA0,IF_LEG)
-
     IF (LHOOK) CALL DR_HOOK('LTINV_MOD',1,ZHOOK_HANDLE)
     END ASSOCIATE
     !     ------------------------------------------------------------------
   END SUBROUTINE LTINV
 END MODULE LTINV_MOD
-
