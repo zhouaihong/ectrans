@@ -1879,6 +1879,8 @@ subroutine gstats_labels
   call gstats_label(471, '   ', 'LEINV          - Antisym GEMM')
   call gstats_label(472, '   ', 'LEINV          - Sym gather')
   call gstats_label(473, '   ', 'LEINV          - Sym GEMM')
+  call gstats_label(474, '   ', 'LEINV          - Input data setup')
+  call gstats_label(475, '   ', 'LEINV          - Close input data')
   call gstats_label(421, '   ', 'TRANS          - MPI/update exchange')
   call gstats_label(422, '   ', 'TRANS          - Finalize/update host')
   call gstats_label(425, '   ', 'TRLTOG         - Close data regions')
