@@ -106,8 +106,7 @@ CONTAINS
     USE TPM_TRANS,              ONLY: LDIVGP, LVORGP, NF_SC2, NF_SC3A, NF_SC3B, LSCDERS
     USE BUFFERED_ALLOCATOR_MOD, ONLY: BUFFERED_ALLOCATOR, ASSIGN_PTR, GET_ALLOCATION
     USE TPM_DISTR,              ONLY: D
-    USE LTINV_PACK_MOD,         ONLY: LTINV_PACK_SPEC, LTINV_PACK_UV, LTINV_PACK_NSDER, &
-     &                                LTINV_ZERO_PACK_PADDING
+    USE LTINV_PACK_MOD,         ONLY: LTINV_PACK_SPEC, LTINV_PACK_UV, LTINV_PACK_NSDER
     USE LEINV_MOD,              ONLY: LEINV_STRIDES, LEINV_GEMM_ANTISYM, LEINV_GEMM_SYM
     USE ABORT_TRANS_MOD,        ONLY: ABORT_TRANS
     USE TPM_FIELDS_GPU,         ONLY: FG
@@ -375,8 +374,8 @@ CONTAINS
       WRITE(0,*) 'LTINV:IF_LEG,IFIRST',IF_LEG,IFIRST
       CALL ABORT_TRANS('LTINV_MOD:IFIRST /= IF_LEG')
     ENDIF
-    CALL LTINV_ZERO_PACK_PADDING(ZINP,ZINP0,IF_LEG,.TRUE.,&
-                               & IIN_STRIDES0,IIN0_STRIDES0)
+    ! Padding slots are outside the grouped GEMM K extent, so no separate
+    ! clear kernel is needed here.
     IF (LSYNC_TRANS) THEN
 #ifdef ACCGPU
       !$ACC WAIT(1)
@@ -467,8 +466,8 @@ CONTAINS
       WRITE(0,*) 'LTINV:IF_LEG,IFIRST',IF_LEG,IFIRST
       CALL ABORT_TRANS('LTINV_MOD:IFIRST /= IF_LEG')
     ENDIF
-    CALL LTINV_ZERO_PACK_PADDING(ZINP,ZINP0,IF_LEG,.FALSE.,&
-                               & IIN_STRIDES0,IIN0_STRIDES0)
+    ! Padding slots are outside the grouped GEMM K extent, so no separate
+    ! clear kernel is needed here.
     IF (LSYNC_TRANS) THEN
 #ifdef ACCGPU
       !$ACC WAIT(1)
