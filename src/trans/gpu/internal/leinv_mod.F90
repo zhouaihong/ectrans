@@ -482,6 +482,9 @@ CONTAINS
       CALL MPL_BARRIER(MPL_ALL_MS_COMM,CDSTRING='')
       CALL GSTATS(444,1)
     ENDIF
+#ifdef ACCGPU
+    !$ACC WAIT(1)
+#endif
     CALL GSTATS(473,1)
     CALL GSTATS(424,1)
 
@@ -489,8 +492,6 @@ CONTAINS
     !$OMP END TARGET DATA
 #endif
 #ifdef ACCGPU
-    !$ACC WAIT(1)
-
     !$ACC END DATA
 #endif
 
@@ -781,6 +782,9 @@ CONTAINS
       CALL MPL_BARRIER(MPL_ALL_MS_COMM,CDSTRING='')
       CALL GSTATS(444,1)
     ENDIF
+#ifdef ACCGPU
+    !$ACC WAIT(1)
+#endif
     CALL GSTATS(473,1)
     CALL GSTATS(424,1)
 
@@ -788,7 +792,6 @@ CONTAINS
     !$OMP END TARGET DATA
 #endif
 #ifdef ACCGPU
-    !$ACC WAIT(1)
     !$ACC END DATA
 #endif
 
