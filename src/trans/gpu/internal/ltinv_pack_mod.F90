@@ -465,4 +465,504 @@ CONTAINS
     END ASSOCIATE
   END SUBROUTINE LTINV_PACK_NSDER
 
+  SUBROUTINE LTINV_PACK_SPEC_PAIR(ZINPA,ZINPA0,ZINPS,ZINPS0,PSPEC,KFIELDS,KOUT_FIELD,&
+                                & KIIN_STRIDES0,KIIN0_STRIDES0)
+    USE PARKIND_ECTRANS, ONLY: JPIM, JPIB, JPRB, JPRBT, JPRD
+    USE TPM_DIM,         ONLY: R
+    USE TPM_DISTR,       ONLY: D
+
+    IMPLICIT NONE
+
+    REAL(KIND=JPRBT), INTENT(INOUT) :: ZINPA(:), ZINPS(:)
+    REAL(KIND=JPRD),  INTENT(INOUT) :: ZINPA0(:), ZINPS0(:)
+    REAL(KIND=JPRB),  INTENT(IN)    :: PSPEC(:,:)
+    INTEGER(KIND=JPIM), INTENT(IN)  :: KFIELDS, KOUT_FIELD
+    INTEGER(KIND=JPIM), INTENT(IN)  :: KIIN_STRIDES0, KIIN0_STRIDES0
+
+    INTEGER(KIND=JPIM) :: KMLOC, JFLD, J, KM, ILEN, IPAR, JN, INM
+    INTEGER(KIND=JPIM) :: IOUTR
+    INTEGER(KIND=JPIB) :: IPOS
+    REAL(KIND=JPRB)    :: ZR, ZI
+
+    ASSOCIATE(D_NUMP=>D%NUMP, D_MYMS=>D%MYMS, D_NASM0=>D%NASM0, &
+             &D_OFFSETS_GEMM2=>D%OFFSETS_GEMM2, R_NSMAX=>R%NSMAX)
+
+#ifdef ACCGPU
+    !$ACC DATA PRESENT(D,D_MYMS,D_NASM0,D_OFFSETS_GEMM2,R,R_NSMAX,ZINPA,ZINPA0,ZINPS,ZINPS0,PSPEC) ASYNC(1)
+#endif
+#ifdef OMPGPU
+    !$OMP TARGET DATA MAP(PRESENT,ALLOC:D,D_MYMS,D_NASM0,D_OFFSETS_GEMM2,R,R_NSMAX,ZINPA,ZINPA0,ZINPS,ZINPS0,PSPEC)
+#endif
+
+#ifdef OMPGPU
+    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(3) DEFAULT(NONE) &
+    !$OMP& PRIVATE(KM,ILEN,IPAR,JN,INM,IOUTR,IPOS,ZR,ZI) &
+    !$OMP& SHARED(D_NUMP,D_MYMS,D_NASM0,D_OFFSETS_GEMM2,R_NSMAX,PSPEC,ZINPA,ZINPA0,ZINPS,ZINPS0) &
+    !$OMP& FIRSTPRIVATE(KFIELDS,KOUT_FIELD,KIIN_STRIDES0,KIIN0_STRIDES0)
+#endif
+#ifdef ACCGPU
+    !$ACC PARALLEL LOOP COLLAPSE(3) DEFAULT(NONE) &
+    !$ACC& PRIVATE(KM,ILEN,IPAR,JN,INM,IOUTR,IPOS,ZR,ZI) &
+    !$ACC& FIRSTPRIVATE(KFIELDS,KOUT_FIELD,KIIN_STRIDES0,KIIN0_STRIDES0) &
+#ifndef _CRAYFTN
+    !$ACC& ASYNC(1)
+#else
+    !$ACC&
+#endif
+#endif
+    DO KMLOC=1,D%NUMP
+      DO J=1,(R_NSMAX+3)/2
+        DO JFLD=1,KFIELDS
+          KM = D_MYMS(KMLOC)
+
+          ILEN = (R_NSMAX-KM+2)/2
+          IPAR = 1+MOD(R_NSMAX-KM+2,2)
+          IF (J <= ILEN) THEN
+            JN = R_NSMAX+2-IPAR-2*(J-1)
+            ZR = 0.0_JPRB
+            ZI = 0.0_JPRB
+            IF (JN >= KM .AND. JN <= R_NSMAX) THEN
+              INM = D_NASM0(KM)+(JN-KM)*2
+              ZR = PSPEC(JFLD,INM)
+              ZI = PSPEC(JFLD,INM+1)
+            ENDIF
+
+            IF (KM /= 0) THEN
+              IOUTR = 2*(KOUT_FIELD+JFLD)-1
+              IPOS = IOUTR+(J-1)*KIIN_STRIDES0+D_OFFSETS_GEMM2(KMLOC)*KIIN_STRIDES0
+              ZINPA(IPOS) = REAL(ZR,JPRBT)
+              ZINPA(IPOS+1) = REAL(ZI,JPRBT)
+            ELSE
+              IPOS = KOUT_FIELD+JFLD+(J-1)*KIIN0_STRIDES0
+              ZINPA0(IPOS) = REAL(ZR,JPRD)
+            ENDIF
+          ENDIF
+
+          ILEN = (R_NSMAX-KM+3)/2
+          IPAR = 1+MOD(R_NSMAX-KM+1,2)
+          IF (J <= ILEN) THEN
+            JN = R_NSMAX+2-IPAR-2*(J-1)
+            ZR = 0.0_JPRB
+            ZI = 0.0_JPRB
+            IF (JN >= KM .AND. JN <= R_NSMAX) THEN
+              INM = D_NASM0(KM)+(JN-KM)*2
+              ZR = PSPEC(JFLD,INM)
+              ZI = PSPEC(JFLD,INM+1)
+            ENDIF
+
+            IF (KM /= 0) THEN
+              IOUTR = 2*(KOUT_FIELD+JFLD)-1
+              IPOS = IOUTR+(J-1)*KIIN_STRIDES0+D_OFFSETS_GEMM2(KMLOC)*KIIN_STRIDES0
+              ZINPS(IPOS) = REAL(ZR,JPRBT)
+              ZINPS(IPOS+1) = REAL(ZI,JPRBT)
+            ELSE
+              IPOS = KOUT_FIELD+JFLD+(J-1)*KIIN0_STRIDES0
+              ZINPS0(IPOS) = REAL(ZR,JPRD)
+            ENDIF
+          ENDIF
+        ENDDO
+      ENDDO
+    ENDDO
+
+#ifdef OMPGPU
+    !$OMP END TARGET DATA
+#endif
+#ifdef ACCGPU
+    !$ACC END DATA
+#endif
+
+    END ASSOCIATE
+  END SUBROUTINE LTINV_PACK_SPEC_PAIR
+
+  SUBROUTINE LTINV_PACK_UV_PAIR(ZINPA,ZINPA0,ZINPS,ZINPS0,PSPVOR,PSPDIV,KFIELDS,&
+                              & KOUT_U,KOUT_V,PEPSNM,KIIN_STRIDES0,KIIN0_STRIDES0)
+    USE PARKIND_ECTRANS, ONLY: JPIM, JPIB, JPRB, JPRBT, JPRD
+    USE TPM_DIM,         ONLY: R
+    USE TPM_DISTR,       ONLY: D
+    USE TPM_FIELDS,      ONLY: F
+
+    IMPLICIT NONE
+
+    REAL(KIND=JPRBT), INTENT(INOUT) :: ZINPA(:), ZINPS(:)
+    REAL(KIND=JPRD),  INTENT(INOUT) :: ZINPA0(:), ZINPS0(:)
+    REAL(KIND=JPRB),  INTENT(IN)    :: PSPVOR(:,:), PSPDIV(:,:)
+    REAL(KIND=JPRBT), INTENT(IN)    :: PEPSNM(1:D%NUMP,0:R%NTMAX+2)
+    INTEGER(KIND=JPIM), INTENT(IN)  :: KFIELDS, KOUT_U, KOUT_V
+    INTEGER(KIND=JPIM), INTENT(IN)  :: KIIN_STRIDES0, KIIN0_STRIDES0
+
+    INTEGER(KIND=JPIM) :: KMLOC, JFLD, J, KM, ILEN, IPAR, JN
+    INTEGER(KIND=JPIM) :: INM, IOUTR
+    INTEGER(KIND=JPIB) :: IPOS
+    REAL(KIND=JPRBT)   :: ZKM
+    REAL(KIND=JPRB)    :: VOR_R, VOR_I, DIV_R, DIV_I
+    REAL(KIND=JPRB)    :: VOR_R_M1, VOR_I_M1, VOR_R_P1, VOR_I_P1
+    REAL(KIND=JPRB)    :: DIV_R_M1, DIV_I_M1, DIV_R_P1, DIV_I_P1
+    REAL(KIND=JPRB)    :: U_R, U_I, V_R, V_I
+
+    ASSOCIATE(D_NUMP=>D%NUMP, D_MYMS=>D%MYMS, D_NASM0=>D%NASM0, &
+             &D_OFFSETS_GEMM2=>D%OFFSETS_GEMM2, R_NSMAX=>R%NSMAX, &
+             &R_NTMAX=>R%NTMAX, F_RLAPIN=>F%RLAPIN)
+
+#ifdef ACCGPU
+    !$ACC DATA PRESENT(D,D_MYMS,D_NASM0,D_OFFSETS_GEMM2,R,R_NSMAX,R_NTMAX,F,F_RLAPIN) &
+    !$ACC&     PRESENT(ZINPA,ZINPA0,ZINPS,ZINPS0,PSPVOR,PSPDIV,PEPSNM) ASYNC(1)
+#endif
+#ifdef OMPGPU
+    !$OMP TARGET DATA MAP(PRESENT,ALLOC:D,D_MYMS,D_NASM0,D_OFFSETS_GEMM2,R,R_NSMAX,R_NTMAX,F,F_RLAPIN) &
+    !$OMP&            MAP(PRESENT,ALLOC:ZINPA,ZINPA0,ZINPS,ZINPS0,PSPVOR,PSPDIV,PEPSNM)
+#endif
+
+#ifdef OMPGPU
+    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(3) DEFAULT(NONE) &
+    !$OMP& PRIVATE(KM,ILEN,IPAR,JN,INM,IOUTR,IPOS,ZKM) &
+    !$OMP& PRIVATE(VOR_R,VOR_I,DIV_R,DIV_I,VOR_R_M1,VOR_I_M1,VOR_R_P1,VOR_I_P1) &
+    !$OMP& PRIVATE(DIV_R_M1,DIV_I_M1,DIV_R_P1,DIV_I_P1,U_R,U_I,V_R,V_I) &
+    !$OMP& SHARED(D_NUMP,D_MYMS,D_NASM0,D_OFFSETS_GEMM2,R_NSMAX,R_NTMAX,F_RLAPIN) &
+    !$OMP& SHARED(PSPVOR,PSPDIV,PEPSNM,ZINPA,ZINPA0,ZINPS,ZINPS0) &
+    !$OMP& FIRSTPRIVATE(KFIELDS,KOUT_U,KOUT_V,KIIN_STRIDES0,KIIN0_STRIDES0)
+#endif
+#ifdef ACCGPU
+    !$ACC PARALLEL LOOP COLLAPSE(3) DEFAULT(NONE) &
+    !$ACC& PRIVATE(KM,ILEN,IPAR,JN,INM,IOUTR,IPOS,ZKM) &
+    !$ACC& PRIVATE(VOR_R,VOR_I,DIV_R,DIV_I,VOR_R_M1,VOR_I_M1,VOR_R_P1,VOR_I_P1) &
+    !$ACC& PRIVATE(DIV_R_M1,DIV_I_M1,DIV_R_P1,DIV_I_P1,U_R,U_I,V_R,V_I) &
+    !$ACC& FIRSTPRIVATE(KFIELDS,KOUT_U,KOUT_V,KIIN_STRIDES0,KIIN0_STRIDES0) &
+#ifndef _CRAYFTN
+    !$ACC& ASYNC(1)
+#else
+    !$ACC&
+#endif
+#endif
+    DO KMLOC=1,D%NUMP
+      DO J=1,(R_NSMAX+3)/2
+        DO JFLD=1,KFIELDS
+          KM = D_MYMS(KMLOC)
+
+          ILEN = (R_NSMAX-KM+2)/2
+          IPAR = 1+MOD(R_NSMAX-KM+2,2)
+          IF (J <= ILEN) THEN
+            JN = R_NSMAX+2-IPAR-2*(J-1)
+            VOR_R = 0.0_JPRB
+            VOR_I = 0.0_JPRB
+            DIV_R = 0.0_JPRB
+            DIV_I = 0.0_JPRB
+            VOR_R_M1 = 0.0_JPRB
+            VOR_I_M1 = 0.0_JPRB
+            VOR_R_P1 = 0.0_JPRB
+            VOR_I_P1 = 0.0_JPRB
+            DIV_R_M1 = 0.0_JPRB
+            DIV_I_M1 = 0.0_JPRB
+            DIV_R_P1 = 0.0_JPRB
+            DIV_I_P1 = 0.0_JPRB
+            U_R = 0.0_JPRB
+            U_I = 0.0_JPRB
+            V_R = 0.0_JPRB
+            V_I = 0.0_JPRB
+
+            IF (JN >= KM .AND. JN <= R_NSMAX) THEN
+              INM = D_NASM0(KM)+(JN-KM)*2
+              VOR_R = PSPVOR(JFLD,INM)
+              VOR_I = PSPVOR(JFLD,INM+1)
+              DIV_R = PSPDIV(JFLD,INM)
+              DIV_I = PSPDIV(JFLD,INM+1)
+            ENDIF
+            IF (JN-1 >= KM .AND. JN-1 <= R_NSMAX) THEN
+              INM = D_NASM0(KM)+(JN-1-KM)*2
+              VOR_R_M1 = PSPVOR(JFLD,INM)
+              VOR_I_M1 = PSPVOR(JFLD,INM+1)
+              DIV_R_M1 = PSPDIV(JFLD,INM)
+              DIV_I_M1 = PSPDIV(JFLD,INM+1)
+            ENDIF
+            IF (JN+1 >= KM .AND. JN+1 <= R_NSMAX) THEN
+              INM = D_NASM0(KM)+(JN+1-KM)*2
+              VOR_R_P1 = PSPVOR(JFLD,INM)
+              VOR_I_P1 = PSPVOR(JFLD,INM+1)
+              DIV_R_P1 = PSPDIV(JFLD,INM)
+              DIV_I_P1 = PSPDIV(JFLD,INM+1)
+            ENDIF
+
+            IF (KM /= 0 .AND. JN >= KM .AND. JN <= R_NTMAX+1) THEN
+              ZKM = REAL(KM,JPRBT)
+              U_R = -ZKM*F_RLAPIN(JN)*DIV_I &
+                  & +(JN-1)*PEPSNM(KMLOC,JN)*F_RLAPIN(JN-1)*VOR_R_M1 &
+                  & -(JN+2)*PEPSNM(KMLOC,JN+1)*F_RLAPIN(JN+1)*VOR_R_P1
+              U_I = +ZKM*F_RLAPIN(JN)*DIV_R &
+                  & +(JN-1)*PEPSNM(KMLOC,JN)*F_RLAPIN(JN-1)*VOR_I_M1 &
+                  & -(JN+2)*PEPSNM(KMLOC,JN+1)*F_RLAPIN(JN+1)*VOR_I_P1
+              V_R = -ZKM*F_RLAPIN(JN)*VOR_I &
+                  & -(JN-1)*PEPSNM(KMLOC,JN)*F_RLAPIN(JN-1)*DIV_R_M1 &
+                  & +(JN+2)*PEPSNM(KMLOC,JN+1)*F_RLAPIN(JN+1)*DIV_R_P1
+              V_I = +ZKM*F_RLAPIN(JN)*VOR_R &
+                  & -(JN-1)*PEPSNM(KMLOC,JN)*F_RLAPIN(JN-1)*DIV_I_M1 &
+                  & +(JN+2)*PEPSNM(KMLOC,JN+1)*F_RLAPIN(JN+1)*DIV_I_P1
+            ELSEIF (KM == 0 .AND. JN <= R_NTMAX+1) THEN
+              U_R = +(JN-1)*PEPSNM(KMLOC,JN)*F_RLAPIN(JN-1)*VOR_R_M1 &
+                  & -(JN+2)*PEPSNM(KMLOC,JN+1)*F_RLAPIN(JN+1)*VOR_R_P1
+              V_R = -(JN-1)*PEPSNM(KMLOC,JN)*F_RLAPIN(JN-1)*DIV_R_M1 &
+                  & +(JN+2)*PEPSNM(KMLOC,JN+1)*F_RLAPIN(JN+1)*DIV_R_P1
+            ENDIF
+
+            IF (KM /= 0) THEN
+              IOUTR = 2*(KOUT_U+JFLD)-1
+              IPOS = IOUTR+(J-1)*KIIN_STRIDES0+D_OFFSETS_GEMM2(KMLOC)*KIIN_STRIDES0
+              ZINPA(IPOS) = REAL(U_R,JPRBT)
+              ZINPA(IPOS+1) = REAL(U_I,JPRBT)
+              IOUTR = 2*(KOUT_V+JFLD)-1
+              IPOS = IOUTR+(J-1)*KIIN_STRIDES0+D_OFFSETS_GEMM2(KMLOC)*KIIN_STRIDES0
+              ZINPA(IPOS) = REAL(V_R,JPRBT)
+              ZINPA(IPOS+1) = REAL(V_I,JPRBT)
+            ELSE
+              IPOS = KOUT_U+JFLD+(J-1)*KIIN0_STRIDES0
+              ZINPA0(IPOS) = REAL(U_R,JPRD)
+              IPOS = KOUT_V+JFLD+(J-1)*KIIN0_STRIDES0
+              ZINPA0(IPOS) = REAL(V_R,JPRD)
+            ENDIF
+          ENDIF
+
+          ILEN = (R_NSMAX-KM+3)/2
+          IPAR = 1+MOD(R_NSMAX-KM+1,2)
+          IF (J <= ILEN) THEN
+            JN = R_NSMAX+2-IPAR-2*(J-1)
+            VOR_R = 0.0_JPRB
+            VOR_I = 0.0_JPRB
+            DIV_R = 0.0_JPRB
+            DIV_I = 0.0_JPRB
+            VOR_R_M1 = 0.0_JPRB
+            VOR_I_M1 = 0.0_JPRB
+            VOR_R_P1 = 0.0_JPRB
+            VOR_I_P1 = 0.0_JPRB
+            DIV_R_M1 = 0.0_JPRB
+            DIV_I_M1 = 0.0_JPRB
+            DIV_R_P1 = 0.0_JPRB
+            DIV_I_P1 = 0.0_JPRB
+            U_R = 0.0_JPRB
+            U_I = 0.0_JPRB
+            V_R = 0.0_JPRB
+            V_I = 0.0_JPRB
+
+            IF (JN >= KM .AND. JN <= R_NSMAX) THEN
+              INM = D_NASM0(KM)+(JN-KM)*2
+              VOR_R = PSPVOR(JFLD,INM)
+              VOR_I = PSPVOR(JFLD,INM+1)
+              DIV_R = PSPDIV(JFLD,INM)
+              DIV_I = PSPDIV(JFLD,INM+1)
+            ENDIF
+            IF (JN-1 >= KM .AND. JN-1 <= R_NSMAX) THEN
+              INM = D_NASM0(KM)+(JN-1-KM)*2
+              VOR_R_M1 = PSPVOR(JFLD,INM)
+              VOR_I_M1 = PSPVOR(JFLD,INM+1)
+              DIV_R_M1 = PSPDIV(JFLD,INM)
+              DIV_I_M1 = PSPDIV(JFLD,INM+1)
+            ENDIF
+            IF (JN+1 >= KM .AND. JN+1 <= R_NSMAX) THEN
+              INM = D_NASM0(KM)+(JN+1-KM)*2
+              VOR_R_P1 = PSPVOR(JFLD,INM)
+              VOR_I_P1 = PSPVOR(JFLD,INM+1)
+              DIV_R_P1 = PSPDIV(JFLD,INM)
+              DIV_I_P1 = PSPDIV(JFLD,INM+1)
+            ENDIF
+
+            IF (KM /= 0 .AND. JN >= KM .AND. JN <= R_NTMAX+1) THEN
+              ZKM = REAL(KM,JPRBT)
+              U_R = -ZKM*F_RLAPIN(JN)*DIV_I &
+                  & +(JN-1)*PEPSNM(KMLOC,JN)*F_RLAPIN(JN-1)*VOR_R_M1 &
+                  & -(JN+2)*PEPSNM(KMLOC,JN+1)*F_RLAPIN(JN+1)*VOR_R_P1
+              U_I = +ZKM*F_RLAPIN(JN)*DIV_R &
+                  & +(JN-1)*PEPSNM(KMLOC,JN)*F_RLAPIN(JN-1)*VOR_I_M1 &
+                  & -(JN+2)*PEPSNM(KMLOC,JN+1)*F_RLAPIN(JN+1)*VOR_I_P1
+              V_R = -ZKM*F_RLAPIN(JN)*VOR_I &
+                  & -(JN-1)*PEPSNM(KMLOC,JN)*F_RLAPIN(JN-1)*DIV_R_M1 &
+                  & +(JN+2)*PEPSNM(KMLOC,JN+1)*F_RLAPIN(JN+1)*DIV_R_P1
+              V_I = +ZKM*F_RLAPIN(JN)*VOR_R &
+                  & -(JN-1)*PEPSNM(KMLOC,JN)*F_RLAPIN(JN-1)*DIV_I_M1 &
+                  & +(JN+2)*PEPSNM(KMLOC,JN+1)*F_RLAPIN(JN+1)*DIV_I_P1
+            ELSEIF (KM == 0 .AND. JN <= R_NTMAX+1) THEN
+              U_R = +(JN-1)*PEPSNM(KMLOC,JN)*F_RLAPIN(JN-1)*VOR_R_M1 &
+                  & -(JN+2)*PEPSNM(KMLOC,JN+1)*F_RLAPIN(JN+1)*VOR_R_P1
+              V_R = -(JN-1)*PEPSNM(KMLOC,JN)*F_RLAPIN(JN-1)*DIV_R_M1 &
+                  & +(JN+2)*PEPSNM(KMLOC,JN+1)*F_RLAPIN(JN+1)*DIV_R_P1
+            ENDIF
+
+            IF (KM /= 0) THEN
+              IOUTR = 2*(KOUT_U+JFLD)-1
+              IPOS = IOUTR+(J-1)*KIIN_STRIDES0+D_OFFSETS_GEMM2(KMLOC)*KIIN_STRIDES0
+              ZINPS(IPOS) = REAL(U_R,JPRBT)
+              ZINPS(IPOS+1) = REAL(U_I,JPRBT)
+              IOUTR = 2*(KOUT_V+JFLD)-1
+              IPOS = IOUTR+(J-1)*KIIN_STRIDES0+D_OFFSETS_GEMM2(KMLOC)*KIIN_STRIDES0
+              ZINPS(IPOS) = REAL(V_R,JPRBT)
+              ZINPS(IPOS+1) = REAL(V_I,JPRBT)
+            ELSE
+              IPOS = KOUT_U+JFLD+(J-1)*KIIN0_STRIDES0
+              ZINPS0(IPOS) = REAL(U_R,JPRD)
+              IPOS = KOUT_V+JFLD+(J-1)*KIIN0_STRIDES0
+              ZINPS0(IPOS) = REAL(V_R,JPRD)
+            ENDIF
+          ENDIF
+        ENDDO
+      ENDDO
+    ENDDO
+
+#ifdef OMPGPU
+    !$OMP END TARGET DATA
+#endif
+#ifdef ACCGPU
+    !$ACC END DATA
+#endif
+
+    END ASSOCIATE
+  END SUBROUTINE LTINV_PACK_UV_PAIR
+
+  SUBROUTINE LTINV_PACK_NSDER_PAIR(ZINPA,ZINPA0,ZINPS,ZINPS0,PSPEC,KFIELDS,KOUT_FIELD,&
+                                 & PEPSNM,KIIN_STRIDES0,KIIN0_STRIDES0)
+    USE PARKIND_ECTRANS, ONLY: JPIM, JPIB, JPRB, JPRBT, JPRD
+    USE TPM_DIM,         ONLY: R
+    USE TPM_DISTR,       ONLY: D
+
+    IMPLICIT NONE
+
+    REAL(KIND=JPRBT), INTENT(INOUT) :: ZINPA(:), ZINPS(:)
+    REAL(KIND=JPRD),  INTENT(INOUT) :: ZINPA0(:), ZINPS0(:)
+    REAL(KIND=JPRB),  INTENT(IN)    :: PSPEC(:,:)
+    REAL(KIND=JPRBT), INTENT(IN)    :: PEPSNM(1:D%NUMP,0:R%NTMAX+2)
+    INTEGER(KIND=JPIM), INTENT(IN)  :: KFIELDS, KOUT_FIELD
+    INTEGER(KIND=JPIM), INTENT(IN)  :: KIIN_STRIDES0, KIIN0_STRIDES0
+
+    INTEGER(KIND=JPIM) :: KMLOC, JFLD, J, KM, ILEN, IPAR, JN, INM
+    INTEGER(KIND=JPIM) :: IOUTR
+    INTEGER(KIND=JPIB) :: IPOS
+    REAL(KIND=JPRB)    :: F_R_M1, F_I_M1, F_R_P1, F_I_P1
+    REAL(KIND=JPRB)    :: ZR, ZI
+
+    ASSOCIATE(D_NUMP=>D%NUMP, D_MYMS=>D%MYMS, D_NASM0=>D%NASM0, &
+             &D_OFFSETS_GEMM2=>D%OFFSETS_GEMM2, R_NSMAX=>R%NSMAX, &
+             &R_NTMAX=>R%NTMAX)
+
+#ifdef ACCGPU
+    !$ACC DATA PRESENT(D,D_MYMS,D_NASM0,D_OFFSETS_GEMM2,R,R_NSMAX,R_NTMAX,ZINPA,ZINPA0,ZINPS,ZINPS0,PSPEC,PEPSNM) ASYNC(1)
+#endif
+#ifdef OMPGPU
+    !$OMP TARGET DATA MAP(PRESENT,ALLOC:D,D_MYMS,D_NASM0,D_OFFSETS_GEMM2,R,R_NSMAX,R_NTMAX,ZINPA,ZINPA0,ZINPS,ZINPS0,PSPEC,PEPSNM)
+#endif
+
+#ifdef OMPGPU
+    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(3) DEFAULT(NONE) &
+    !$OMP& PRIVATE(KM,ILEN,IPAR,JN,INM,IOUTR,IPOS,F_R_M1,F_I_M1,F_R_P1,F_I_P1,ZR,ZI) &
+    !$OMP& SHARED(D_NUMP,D_MYMS,D_NASM0,D_OFFSETS_GEMM2,R_NSMAX,R_NTMAX,PSPEC,PEPSNM,ZINPA,ZINPA0,ZINPS,ZINPS0) &
+    !$OMP& FIRSTPRIVATE(KFIELDS,KOUT_FIELD,KIIN_STRIDES0,KIIN0_STRIDES0)
+#endif
+#ifdef ACCGPU
+    !$ACC PARALLEL LOOP COLLAPSE(3) DEFAULT(NONE) &
+    !$ACC& PRIVATE(KM,ILEN,IPAR,JN,INM,IOUTR,IPOS,F_R_M1,F_I_M1,F_R_P1,F_I_P1,ZR,ZI) &
+    !$ACC& FIRSTPRIVATE(KFIELDS,KOUT_FIELD,KIIN_STRIDES0,KIIN0_STRIDES0) &
+#ifndef _CRAYFTN
+    !$ACC& ASYNC(1)
+#else
+    !$ACC&
+#endif
+#endif
+    DO KMLOC=1,D%NUMP
+      DO J=1,(R_NSMAX+3)/2
+        DO JFLD=1,KFIELDS
+          KM = D_MYMS(KMLOC)
+
+          ILEN = (R_NSMAX-KM+2)/2
+          IPAR = 1+MOD(R_NSMAX-KM+2,2)
+          IF (J <= ILEN) THEN
+            JN = R_NSMAX+2-IPAR-2*(J-1)
+            F_R_M1 = 0.0_JPRB
+            F_I_M1 = 0.0_JPRB
+            F_R_P1 = 0.0_JPRB
+            F_I_P1 = 0.0_JPRB
+            ZR = 0.0_JPRB
+            ZI = 0.0_JPRB
+
+            IF (JN-1 >= KM .AND. JN-1 <= R_NSMAX) THEN
+              INM = D_NASM0(KM)+(JN-1-KM)*2
+              F_R_M1 = PSPEC(JFLD,INM)
+              F_I_M1 = PSPEC(JFLD,INM+1)
+            ENDIF
+            IF (JN+1 >= KM .AND. JN+1 <= R_NSMAX) THEN
+              INM = D_NASM0(KM)+(JN+1-KM)*2
+              F_R_P1 = PSPEC(JFLD,INM)
+              F_I_P1 = PSPEC(JFLD,INM+1)
+            ENDIF
+
+            IF (KM /= 0 .AND. JN >= KM .AND. JN <= R_NTMAX+1) THEN
+              ZR = -(JN-1)*PEPSNM(KMLOC,JN)*F_R_M1 &
+                 & +(JN+2)*PEPSNM(KMLOC,JN+1)*F_R_P1
+              ZI = -(JN-1)*PEPSNM(KMLOC,JN)*F_I_M1 &
+                 & +(JN+2)*PEPSNM(KMLOC,JN+1)*F_I_P1
+            ELSEIF (KM == 0 .AND. JN <= R_NTMAX+1) THEN
+              ZR = -(JN-1)*PEPSNM(KMLOC,JN)*F_R_M1 &
+                 & +(JN+2)*PEPSNM(KMLOC,JN+1)*F_R_P1
+            ENDIF
+
+            IF (KM /= 0) THEN
+              IOUTR = 2*(KOUT_FIELD+JFLD)-1
+              IPOS = IOUTR+(J-1)*KIIN_STRIDES0+D_OFFSETS_GEMM2(KMLOC)*KIIN_STRIDES0
+              ZINPA(IPOS) = REAL(ZR,JPRBT)
+              ZINPA(IPOS+1) = REAL(ZI,JPRBT)
+            ELSE
+              IPOS = KOUT_FIELD+JFLD+(J-1)*KIIN0_STRIDES0
+              ZINPA0(IPOS) = REAL(ZR,JPRD)
+            ENDIF
+          ENDIF
+
+          ILEN = (R_NSMAX-KM+3)/2
+          IPAR = 1+MOD(R_NSMAX-KM+1,2)
+          IF (J <= ILEN) THEN
+            JN = R_NSMAX+2-IPAR-2*(J-1)
+            F_R_M1 = 0.0_JPRB
+            F_I_M1 = 0.0_JPRB
+            F_R_P1 = 0.0_JPRB
+            F_I_P1 = 0.0_JPRB
+            ZR = 0.0_JPRB
+            ZI = 0.0_JPRB
+
+            IF (JN-1 >= KM .AND. JN-1 <= R_NSMAX) THEN
+              INM = D_NASM0(KM)+(JN-1-KM)*2
+              F_R_M1 = PSPEC(JFLD,INM)
+              F_I_M1 = PSPEC(JFLD,INM+1)
+            ENDIF
+            IF (JN+1 >= KM .AND. JN+1 <= R_NSMAX) THEN
+              INM = D_NASM0(KM)+(JN+1-KM)*2
+              F_R_P1 = PSPEC(JFLD,INM)
+              F_I_P1 = PSPEC(JFLD,INM+1)
+            ENDIF
+
+            IF (KM /= 0 .AND. JN >= KM .AND. JN <= R_NTMAX+1) THEN
+              ZR = -(JN-1)*PEPSNM(KMLOC,JN)*F_R_M1 &
+                 & +(JN+2)*PEPSNM(KMLOC,JN+1)*F_R_P1
+              ZI = -(JN-1)*PEPSNM(KMLOC,JN)*F_I_M1 &
+                 & +(JN+2)*PEPSNM(KMLOC,JN+1)*F_I_P1
+            ELSEIF (KM == 0 .AND. JN <= R_NTMAX+1) THEN
+              ZR = -(JN-1)*PEPSNM(KMLOC,JN)*F_R_M1 &
+                 & +(JN+2)*PEPSNM(KMLOC,JN+1)*F_R_P1
+            ENDIF
+
+            IF (KM /= 0) THEN
+              IOUTR = 2*(KOUT_FIELD+JFLD)-1
+              IPOS = IOUTR+(J-1)*KIIN_STRIDES0+D_OFFSETS_GEMM2(KMLOC)*KIIN_STRIDES0
+              ZINPS(IPOS) = REAL(ZR,JPRBT)
+              ZINPS(IPOS+1) = REAL(ZI,JPRBT)
+            ELSE
+              IPOS = KOUT_FIELD+JFLD+(J-1)*KIIN0_STRIDES0
+              ZINPS0(IPOS) = REAL(ZR,JPRD)
+            ENDIF
+          ENDIF
+        ENDDO
+      ENDDO
+    ENDDO
+
+#ifdef OMPGPU
+    !$OMP END TARGET DATA
+#endif
+#ifdef ACCGPU
+    !$ACC END DATA
+#endif
+
+    END ASSOCIATE
+  END SUBROUTINE LTINV_PACK_NSDER_PAIR
+
 END MODULE LTINV_PACK_MOD

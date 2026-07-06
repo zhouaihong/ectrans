@@ -1875,7 +1875,7 @@ subroutine gstats_labels
   call gstats_label(420, '   ', 'INV_TRANS      - GPU external total')
   call gstats_label(423, '   ', 'FTINV          - Execute inverse FFT')
   call gstats_label(424, '   ', 'LEINV          - Legendre GEMM total')
-  call gstats_label(470, '   ', 'LEINV          - Antisym gather')
+  call gstats_label(470, '   ', 'LEINV          - Pair pack')
   call gstats_label(471, '   ', 'LEINV          - Antisym GEMM')
   call gstats_label(472, '   ', 'LEINV          - Sym gather')
   call gstats_label(473, '   ', 'LEINV          - Sym GEMM')
