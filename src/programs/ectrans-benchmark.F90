@@ -187,6 +187,7 @@ integer(kind=jpim) :: iprused, ilevpp, irest, ilev, jlev
 logical :: ldump_values = .false.
 logical :: lpinning = .false.
 logical :: ldump_checksums = .false.
+logical :: lspectral_device_cache = .false.
 character(len=256) :: checksums_filename
 
 integer, external :: ec_mpirank
@@ -632,6 +633,19 @@ write(nout,'(a,i0,a,i0,a)') 'Running for ', iters, ' iterations with ', iters_wa
   & ' extra warm-up iterations'
 write(nout,'(" ")')
 
+lspectral_device_cache = (VERSION == "gpu") .AND. .NOT. lprint_norms .AND. .NOT. ldump_checksums
+
+#ifdef _OPENACC
+if (lspectral_device_cache) then
+  !$ACC ENTER DATA COPYIN(zspvor,zspdiv)
+  if (icall_mode == 1) then
+    !$ACC ENTER DATA COPYIN(zspscalar)
+  else
+    !$ACC ENTER DATA COPYIN(zspsc3a,zspsc2)
+  endif
+endif
+#endif
+
 do jstep = 1, iters+iters_warmup
   if (jstep == iters_warmup + 1) then
     gstats_lstats = .true.
@@ -804,6 +818,17 @@ do jstep = 1, iters+iters_warmup
   endif
   call gstats(3,1)
 enddo
+
+#ifdef _OPENACC
+if (lspectral_device_cache) then
+  if (icall_mode == 1) then
+    !$ACC EXIT DATA COPYOUT(zspscalar)
+  else
+    !$ACC EXIT DATA COPYOUT(zspsc3a,zspsc2)
+  endif
+  !$ACC EXIT DATA COPYOUT(zspvor,zspdiv)
+endif
+#endif
 
 !===================================================================================================
 
