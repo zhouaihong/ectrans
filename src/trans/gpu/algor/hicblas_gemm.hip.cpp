@@ -51,6 +51,11 @@ bool graph_debug_force_group() {
   return value != nullptr && std::strcmp(value, "group") == 0;
 }
 
+bool graph_debug_force_sync_async() {
+  const char *value = std::getenv("ECTRANS_GEMM_DEBUG_SYNC_ASYNC");
+  return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+}
+
 const char *graph_debug_rank() {
   const char *rank = std::getenv("OMPI_COMM_WORLD_RANK");
   if (rank == nullptr)
@@ -642,7 +647,7 @@ void hipblas_dgemm_wrapper_grouped_async(
                                 alpha, A, lda, offsetsA, B, ldb, offsetsB, beta,
                                 C, ldc, offsetsC, batchCount,
                                 *(hipStream_t *)stream, growing_allocator,
-                                false);
+                                graph_debug_force_sync_async());
 }
 
 void clean_gemm(int resol_id) {
