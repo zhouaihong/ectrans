@@ -1908,7 +1908,6 @@ subroutine gstats_labels
   call gstats_label(475, '   ', 'LEINV          - Close input data')
   call gstats_label(476, '   ', 'LEINV          - Pair pack spec')
   call gstats_label(477, '   ', 'LEINV          - Pair pack uv')
-  call gstats_label(478, '   ', 'LEINV          - Pair pack uv+spec')
   call gstats_label(479, '   ', 'LEINV          - Pair pack spec+nsder')
   call gstats_label(421, '   ', 'TRANS          - MPI/update exchange')
   call gstats_label(422, '   ', 'TRANS          - Finalize/update host')
