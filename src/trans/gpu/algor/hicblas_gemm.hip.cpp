@@ -267,7 +267,8 @@ void hipblas_dgemm_wrapper_grouped(int resol_id, int blas_id, char transa,
                                    const double *B, const int *ldb,
                                    const int64_t *offsetsB, double beta,
                                    double *C, int ldc, const int64_t *offsetsC,
-                                   int batchCount, hipStream_t stream, void *,
+                                   int batchCount, hipStream_t stream,
+                                   void *growing_allocator,
                                    bool synchronize = true) {
 
   hipblasOperation_t op_t1 = HIPBLAS_OP_N, op_t2 = HIPBLAS_OP_N;
@@ -276,9 +277,16 @@ void hipblas_dgemm_wrapper_grouped(int resol_id, int blas_id, char transa,
   if (transb == 'T' || transb == 't')
     op_t2 = HIPBLAS_OP_T;
 
+#ifdef USE_GRAPHS_GEMM
+  run_group_graph(hipblas_gemm_grouped<double>(op_t1, op_t2), resol_id, m, n, k,
+                  alpha, A, lda, offsetsA, B, ldb, offsetsB, beta, C, ldc,
+                  offsetsC, batchCount, stream, blas_id, growing_allocator,
+                  synchronize);
+#else
   run_group(hipblas_gemm_grouped<double>(op_t1, op_t2), resol_id, m, n, k,
             alpha, A, lda, offsetsA, B, ldb, offsetsB, beta, C, ldc, offsetsC,
             batchCount, stream, blas_id, synchronize);
+#endif
 }
 
 } // namespace
