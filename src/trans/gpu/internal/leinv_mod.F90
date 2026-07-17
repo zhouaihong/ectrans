@@ -501,23 +501,31 @@ CONTAINS
   END SUBROUTINE LEINV
 
   SUBROUTINE LEINV_GEMM_ANTISYM(ALLOCATOR,ZINP,ZINP0,ZOUTA,ZOUTA0,KF_LEG)
-    USE TPM_GEN,                     ONLY: LSYNC_TRANS, NCUR_RESOL
+    USE TPM_GEN,                     ONLY: NCUR_RESOL
     USE TPM_DIM,                     ONLY: R
     USE TPM_GEOMETRY,                ONLY: G
     USE TPM_FIELDS_GPU,              ONLY: FG
     USE TPM_DISTR,                   ONLY: D
     USE HICBLAS_MOD,                 ONLY: HIP_DGEMM_BATCHED, &
-      &                                    HIP_DGEMM_GROUPED, HIP_SGEMM_GROUPED
+      &                                    HIP_DGEMM_GROUPED, HIP_SGEMM_GROUPED, &
+      &                                    HIP_DGEMM_GROUPED_ASYNC, HIP_SGEMM_GROUPED_ASYNC
     USE, INTRINSIC :: ISO_C_BINDING, ONLY: C_INT, C_LONG, C_LOC
-    USE MPL_MODULE,                  ONLY: MPL_BARRIER,MPL_ALL_MS_COMM
     USE TPM_STATS,                   ONLY: GSTATS => GSTATS_NVTX
 #ifdef ACCGPU
     USE OPENACC_LIB, ONLY: ACC_GET_HIP_STREAM
 #endif
 #ifdef TRANS_SINGLE
-#define HIP_GEMM_PACKED HIP_SGEMM_GROUPED
+#ifdef ACCGPU
+#define HIP_GEMM_PACKED_RUN HIP_SGEMM_GROUPED_ASYNC
 #else
-#define HIP_GEMM_PACKED HIP_DGEMM_GROUPED
+#define HIP_GEMM_PACKED_RUN HIP_SGEMM_GROUPED
+#endif
+#else
+#ifdef ACCGPU
+#define HIP_GEMM_PACKED_RUN HIP_DGEMM_GROUPED_ASYNC
+#else
+#define HIP_GEMM_PACKED_RUN HIP_DGEMM_GROUPED
+#endif
 #endif
 
     IMPLICIT NONE
@@ -612,7 +620,7 @@ CONTAINS
 #ifdef ACCGPU
     !$ACC HOST_DATA USE_DEVICE(ZAA,ZINP,ZOUTA)
 #endif
-    CALL HIP_GEMM_PACKED( &
+    CALL HIP_GEMM_PACKED_RUN( &
       & NCUR_RESOL, 11, &
       & 'N', 'T', &
       & 2*KF_LEG, NS(:), KS(:), &
@@ -629,14 +637,6 @@ CONTAINS
     !$OMP END TARGET DATA
 #endif
 
-    IF (LSYNC_TRANS) THEN
-#ifdef ACCGPU
-      !$ACC WAIT(1)
-#endif
-      CALL GSTATS(444,0)
-      CALL MPL_BARRIER(MPL_ALL_MS_COMM,CDSTRING='')
-      CALL GSTATS(444,1)
-    ENDIF
     CALL GSTATS(471,1)
     CALL GSTATS(424,1)
 
@@ -657,7 +657,8 @@ CONTAINS
     USE TPM_FIELDS_GPU,              ONLY: FG
     USE TPM_DISTR,                   ONLY: D
     USE HICBLAS_MOD,                 ONLY: HIP_DGEMM_BATCHED, &
-      &                                    HIP_DGEMM_GROUPED, HIP_SGEMM_GROUPED
+      &                                    HIP_DGEMM_GROUPED, HIP_SGEMM_GROUPED, &
+      &                                    HIP_DGEMM_GROUPED_ASYNC, HIP_SGEMM_GROUPED_ASYNC
     USE, INTRINSIC :: ISO_C_BINDING, ONLY: C_INT, C_LONG, C_LOC
     USE MPL_MODULE,                  ONLY: MPL_BARRIER,MPL_ALL_MS_COMM
     USE TPM_STATS,                   ONLY: GSTATS => GSTATS_NVTX
@@ -688,7 +689,7 @@ CONTAINS
         D_OFFSETS_GEMM2=>D%OFFSETS_GEMM2, ZAS=>FG%ZAS, ZAS0=>FG%ZAS0)
 
 #ifdef ACCGPU
-    HIP_STREAM = INT(ACC_GET_HIP_STREAM(1_C_INT), C_LONG)
+    HIP_STREAM = INT(ACC_GET_HIP_STREAM(2_C_INT), C_LONG)
 #endif
 #ifdef OMPGPU
     HIP_STREAM = 0_C_LONG
@@ -757,7 +758,7 @@ CONTAINS
 #ifdef ACCGPU
     !$ACC HOST_DATA USE_DEVICE(ZAS,ZINP,ZOUTS)
 #endif
-    CALL HIP_GEMM_PACKED( &
+    CALL HIP_GEMM_PACKED_RUN( &
       & NCUR_RESOL, 12, &
       & 'N', 'T', &
       & 2*KF_LEG, NS(:), KS(:), &
@@ -774,17 +775,14 @@ CONTAINS
     !$OMP END TARGET DATA
 #endif
 
-    IF (LSYNC_TRANS) THEN
 #ifdef ACCGPU
-      !$ACC WAIT(1)
+    !$ACC WAIT(1,2)
 #endif
+    IF (LSYNC_TRANS) THEN
       CALL GSTATS(444,0)
       CALL MPL_BARRIER(MPL_ALL_MS_COMM,CDSTRING='')
       CALL GSTATS(444,1)
     ENDIF
-#ifdef ACCGPU
-    !$ACC WAIT(1)
-#endif
     CALL GSTATS(473,1)
     CALL GSTATS(424,1)
 

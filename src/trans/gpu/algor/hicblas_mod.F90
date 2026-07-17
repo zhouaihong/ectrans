@@ -109,4 +109,52 @@ INTERFACE
   END SUBROUTINE HIP_SGEMM_GROUPED
 END INTERFACE
 
+INTERFACE
+  SUBROUTINE HIP_DGEMM_GROUPED_ASYNC( &
+    & RESOL_ID, BLAS_ID, CTA, CTB,        &
+    & M, N, K,                  &
+    & ALPHA,                    &
+    & A, LDA, OFFSETA,          &
+    & B, LDB, OFFSETB,          &
+    & BETA,                     &
+    & C, LDC, OFFSETC,          &
+    & BATCHCOUNT, STREAM, ALLOC &
+  &) BIND(C, NAME='hipblas_dgemm_wrapper_grouped_async')
+    USE ISO_C_BINDING, ONLY: C_CHAR, C_INT, C_DOUBLE, C_SIZE_T, C_PTR, C_INT64_T
+    CHARACTER(1,C_CHAR), VALUE :: CTA, CTB
+    INTEGER(C_INT), VALUE  :: RESOL_ID, BLAS_ID, M, LDA, LDC, BATCHCOUNT
+    INTEGER(C_INT)         :: N(*), K(*), LDB(*)
+    INTEGER(C_INT64_T)     :: OFFSETA(*), OFFSETB(*), OFFSETC(*)
+    REAL(C_DOUBLE), VALUE  :: ALPHA,BETA
+    TYPE(C_PTR), INTENT(IN), VALUE :: A
+    TYPE(C_PTR), INTENT(IN), VALUE :: B
+    TYPE(C_PTR), INTENT(IN), VALUE :: C
+    INTEGER(KIND=C_SIZE_T) :: STREAM
+    TYPE(C_PTR), INTENT(IN), VALUE :: ALLOC
+  END SUBROUTINE HIP_DGEMM_GROUPED_ASYNC
+
+  SUBROUTINE HIP_SGEMM_GROUPED_ASYNC( &
+    & RESOL_ID, BLAS_ID, CTA, CTB,        &
+    & M, N, K,                  &
+    & ALPHA,                    &
+    & A, LDA, OFFSETA,          &
+    & B, LDB, OFFSETB,          &
+    & BETA,                     &
+    & C, LDC, OFFSETC,          &
+    & BATCHCOUNT, STREAM, ALLOC &
+  &) BIND(C, NAME='hipblas_sgemm_wrapper_grouped_async')
+    USE ISO_C_BINDING, ONLY: C_CHAR, C_INT, C_FLOAT, C_SIZE_T, C_PTR, C_INT64_T
+    CHARACTER(1,C_CHAR), VALUE :: CTA, CTB
+    INTEGER(C_INT), VALUE :: RESOL_ID, BLAS_ID, M, LDA, LDC, BATCHCOUNT
+    INTEGER(C_INT)        :: N(*), K(*), LDB(*)
+    INTEGER(C_INT64_T)    :: OFFSETA(*), OFFSETB(*), OFFSETC(*)
+    REAL(C_FLOAT), VALUE  :: ALPHA, BETA
+    TYPE(C_PTR), INTENT(IN), VALUE :: A
+    TYPE(C_PTR), INTENT(IN), VALUE :: B
+    TYPE(C_PTR), INTENT(IN), VALUE :: C
+    INTEGER(KIND=C_SIZE_T) :: STREAM
+    TYPE(C_PTR), INTENT(IN), VALUE :: ALLOC
+  END SUBROUTINE HIP_SGEMM_GROUPED_ASYNC
+END INTERFACE
+
 END MODULE HICBLAS_MOD

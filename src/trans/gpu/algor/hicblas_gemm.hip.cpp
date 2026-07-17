@@ -90,7 +90,8 @@ void run_group_graph(Gemm &&gemm, int resol_id, int m, const int *n,
                      const int64_t *offsetsA, const Real *B, const int *ldb,
                      const int64_t *offsetsB, Real beta, Real *C, int ldc,
                      const int64_t *offsetsC, int batchCount,
-                     hipStream_t stream, int blas_id, void *growing_allocator) {
+                     hipStream_t stream, int blas_id, void *growing_allocator,
+                     bool synchronize = true) {
   growing_allocator_register_free_c(growing_allocator,
                                     free_gemm_graph_cache<Gemm>);
 
@@ -171,7 +172,8 @@ void run_group_graph(Gemm &&gemm, int resol_id, int m, const int *n,
   }
 
   HIC_CHECK(hipGraphLaunch(*graphCache.at(key), stream));
-  HIC_CHECK(hipStreamSynchronize(stream));
+  if (synchronize)
+    HIC_CHECK(hipStreamSynchronize(stream));
 }
 
 // stupid simple gemm calls
@@ -180,14 +182,16 @@ void run_group(Gemm &&gemm, int resol_id, int m, const int *n, const int *k,
                Real alpha, const Real *A, int lda, const int64_t *offsetsA,
                const Real *B, const int *ldb, const int64_t *offsetsB,
                Real beta, Real *C, int ldc, const int64_t *offsetsC,
-               int batchCount, hipStream_t stream, int = -1) {
+               int batchCount, hipStream_t stream, int = -1,
+               bool synchronize = true) {
   for (int i = 0; i < batchCount; ++i) {
     if (m == 0 || n[i] == 0 || k[i] == 0)
       continue;
     gemm(stream, m, n[i], k[i], alpha, A + offsetsA[i], lda, B + offsetsB[i],
          ldb[i], beta, C + offsetsC[i], ldc);
   }
-  HIC_CHECK(hipStreamSynchronize(stream));
+  if (synchronize)
+    HIC_CHECK(hipStreamSynchronize(stream));
 }
 
 #ifdef USE_CUTLASS
@@ -234,7 +238,7 @@ void hipblas_sgemm_wrapper_grouped(
     const int *k, float alpha, const float *A, int lda, const int64_t *offsetsA,
     const float *B, const int *ldb, const int64_t *offsetsB, float beta,
     float *C, int ldc, const int64_t *offsetsC, int batchCount,
-    hipStream_t stream, void *growing_allocator) {
+    hipStream_t stream, void *growing_allocator, bool synchronize = true) {
 
   hipblasOperation_t op_t1 = HIPBLAS_OP_N, op_t2 = HIPBLAS_OP_N;
   if (transa == 'T' || transa == 't')
@@ -245,11 +249,12 @@ void hipblas_sgemm_wrapper_grouped(
 #ifdef USE_GRAPHS_GEMM
   run_group_graph(hipblas_gemm_grouped<float>(op_t1, op_t2), resol_id, m, n, k,
                   alpha, A, lda, offsetsA, B, ldb, offsetsB, beta, C, ldc,
-                  offsetsC, batchCount, stream, blas_id, growing_allocator);
+                  offsetsC, batchCount, stream, blas_id, growing_allocator,
+                  synchronize);
 #else
   run_group(hipblas_gemm_grouped<float>(op_t1, op_t2), resol_id, m, n, k, alpha,
             A, lda, offsetsA, B, ldb, offsetsB, beta, C, ldc, offsetsC,
-            batchCount, stream);
+            batchCount, stream, blas_id, synchronize);
 #endif
 }
 
@@ -262,7 +267,8 @@ void hipblas_dgemm_wrapper_grouped(int resol_id, int blas_id, char transa,
                                    const double *B, const int *ldb,
                                    const int64_t *offsetsB, double beta,
                                    double *C, int ldc, const int64_t *offsetsC,
-                                   int batchCount, hipStream_t stream, void *) {
+                                   int batchCount, hipStream_t stream, void *,
+                                   bool synchronize = true) {
 
   hipblasOperation_t op_t1 = HIPBLAS_OP_N, op_t2 = HIPBLAS_OP_N;
   if (transa == 'T' || transa == 't')
@@ -272,7 +278,7 @@ void hipblas_dgemm_wrapper_grouped(int resol_id, int blas_id, char transa,
 
   run_group(hipblas_gemm_grouped<double>(op_t1, op_t2), resol_id, m, n, k,
             alpha, A, lda, offsetsA, B, ldb, offsetsB, beta, C, ldc, offsetsC,
-            batchCount, stream, blas_id);
+            batchCount, stream, blas_id, synchronize);
 }
 
 } // namespace
@@ -341,6 +347,26 @@ void hipblas_sgemm_wrapper_grouped(
 #endif
 }
 
+void hipblas_sgemm_wrapper_grouped_async(
+    int resol_id, int blas_id, char transa, char transb, int m, const int *n,
+    const int *k, float alpha, const float *A, int lda, const int64_t *offsetsA,
+    const float *B, const int *ldb, const int64_t *offsetsB, float beta,
+    float *C, int ldc, const int64_t *offsetsC, int batchCount, size_t stream,
+    void *growing_allocator) {
+#ifdef USE_CUTLASS
+  cutlass_sgemm_wrapper_grouped(resol_id, blas_id, transa, transb, m, n, k,
+                                alpha, A, lda, offsetsA, B, ldb, offsetsB, beta,
+                                C, ldc, offsetsC, batchCount,
+                                *(hipStream_t *)stream, growing_allocator);
+#else
+  hipblas_sgemm_wrapper_grouped(resol_id, blas_id, transa, transb, m, n, k,
+                                alpha, A, lda, offsetsA, B, ldb, offsetsB, beta,
+                                C, ldc, offsetsC, batchCount,
+                                *(hipStream_t *)stream, growing_allocator,
+                                false);
+#endif
+}
+
 void hipblas_dgemm_wrapper_grouped(int resol_id, int blas_id, char transa,
                                    char transb, int m, const int *n,
                                    const int *k, double alpha, const double *A,
@@ -354,6 +380,20 @@ void hipblas_dgemm_wrapper_grouped(int resol_id, int blas_id, char transa,
                                 alpha, A, lda, offsetsA, B, ldb, offsetsB, beta,
                                 C, ldc, offsetsC, batchCount,
                                 *(hipStream_t *)stream, growing_allocator);
+}
+
+void hipblas_dgemm_wrapper_grouped_async(
+    int resol_id, int blas_id, char transa, char transb, int m, const int *n,
+    const int *k, double alpha, const double *A, int lda,
+    const int64_t *offsetsA, const double *B, const int *ldb,
+    const int64_t *offsetsB, double beta, double *C, int ldc,
+    const int64_t *offsetsC, int batchCount, size_t stream,
+    void *growing_allocator) {
+  hipblas_dgemm_wrapper_grouped(resol_id, blas_id, transa, transb, m, n, k,
+                                alpha, A, lda, offsetsA, B, ldb, offsetsB, beta,
+                                C, ldc, offsetsC, batchCount,
+                                *(hipStream_t *)stream, growing_allocator,
+                                false);
 }
 
 void clean_gemm(int resol_id) {
