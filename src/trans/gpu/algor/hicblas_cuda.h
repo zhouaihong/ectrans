@@ -56,6 +56,7 @@
 #define hipGraphLaunch cudaGraphLaunch
 #define hipGraphInstantiate cudaGraphInstantiate
 #define hipGraphAddChildGraphNode cudaGraphAddChildGraphNode
+#define hipGraphGetNodes cudaGraphGetNodes
 #define hipStreamCreate cudaStreamCreate
 #define hipStreamDestroy cudaStreamDestroy
 #define hipStreamCaptureModeGlobal cudaStreamCaptureModeGlobal
