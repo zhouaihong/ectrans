@@ -11,7 +11,7 @@
 INTERFACE
 SUBROUTINE DIR_TRANS(PSPVOR,PSPDIV,PSPSCALAR,PSPSC3A,PSPSC3B,PSPSC2,&
 & LDLATLON,KPROMA,KVSETUV,KVSETSC,KRESOL,KVSETSC3A,KVSETSC3B,KVSETSC2,&
-& PGP,PGPUV,PGP3A,PGP3B,PGP2)
+& PGP,PGPUV,PGP3A,PGP3B,PGP2,LDUPDATE_DEVICE)
 
 
 !**** *DIR_TRANS* - Direct spectral transform (from grid-point to spectral).
@@ -49,6 +49,7 @@ SUBROUTINE DIR_TRANS(PSPVOR,PSPDIV,PSPSCALAR,PSPSC3A,PSPSC3B,PSPSC2,&
 !     KVSETSC2(:) - as KVESETSC for PSPSC2 (distribution on first dimension)
 !     KRESOL   - resolution tag  which is required ,default is the
 !                first defined resulution (input)
+!     LDUPDATE_DEVICE - update gridpoint input arrays on the device before use (GPU only)
 !     PGP(:,:,:) - gridpoint fields (input)
 !                  PGP need to  dimensioned (NPROMA,IF_GP,NGPBLKS) where
 !                  NPROMA is the blocking factor, IF_GP the total number
@@ -129,6 +130,7 @@ INTEGER(KIND=JPIM) ,OPTIONAL, INTENT(IN) :: KVSETSC3B(:)
 INTEGER(KIND=JPIM) ,OPTIONAL, INTENT(IN) :: KVSETSC2(:)
 INTEGER(KIND=JPIM) ,OPTIONAL, INTENT(IN) :: KRESOL
 LOGICAL   ,OPTIONAL, INTENT(IN) :: LDLATLON
+LOGICAL   ,OPTIONAL, INTENT(IN) :: LDUPDATE_DEVICE
 
 REAL(KIND=JPRB),OPTIONAL    ,INTENT(IN) :: PGP(:,:,:)
 REAL(KIND=JPRB),OPTIONAL    ,INTENT(IN) :: PGPUV(:,:,:,:)

@@ -13,7 +13,7 @@ SUBROUTINE INV_TRANS(PSPVOR,PSPDIV,PSPSCALAR,PSPSC3A,PSPSC3B,PSPSC2,&
  & FSPGL_PROC,&
  & LDSCDERS,LDVORGP,LDDIVGP,LDUVDER,LDLATLON,KPROMA,KVSETUV,KVSETSC,KRESOL,&
  & KVSETSC3A,KVSETSC3B,KVSETSC2,&
- & PGP,PGPUV,PGP3A,PGP3B,PGP2)
+ & PGP,PGPUV,PGP3A,PGP3B,PGP2,LDUPDATE_HOST)
 
 !**** *INV_TRANS* - Inverse spectral transform.
 
@@ -56,6 +56,7 @@ SUBROUTINE INV_TRANS(PSPVOR,PSPDIV,PSPSCALAR,PSPSC3A,PSPSC3B,PSPSC2,&
 !     KVSETSC2(:) - as KVESETSC for PSPSC2 (distribution on first dimension)
 !     KRESOL   - resolution tag  which is required ,default is the
 !                first defined resulution (input)
+!     LDUPDATE_HOST - update gridpoint output arrays on the host before return (GPU only)
 !     PGP(:,:,:) - gridpoint fields (output)
 !                  PGP need to  dimensioned (NPROMA,IF_GP,NGPBLKS) where
 !                  NPROMA is the blocking factor, IF_GP the total number
@@ -142,6 +143,7 @@ LOGICAL   ,OPTIONAL, INTENT(IN) :: LDVORGP
 LOGICAL   ,OPTIONAL, INTENT(IN) :: LDDIVGP
 LOGICAL   ,OPTIONAL, INTENT(IN) :: LDUVDER
 LOGICAL   ,OPTIONAL, INTENT(IN) :: LDLATLON
+LOGICAL   ,OPTIONAL, INTENT(IN) :: LDUPDATE_HOST
 INTEGER(KIND=JPIM) ,OPTIONAL, INTENT(IN) :: KPROMA
 INTEGER(KIND=JPIM) ,OPTIONAL, INTENT(IN) :: KVSETUV(:)
 INTEGER(KIND=JPIM) ,OPTIONAL, INTENT(IN) :: KVSETSC(:)
