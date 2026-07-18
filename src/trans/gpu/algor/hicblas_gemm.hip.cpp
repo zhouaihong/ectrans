@@ -47,13 +47,19 @@ bool graph_debug_enabled() {
 }
 
 bool graph_debug_force_group() {
-  const char *value = std::getenv("ECTRANS_GEMM_GRAPH_MODE");
-  return value != nullptr && std::strcmp(value, "group") == 0;
+  static const bool enabled = [] {
+    const char *value = std::getenv("ECTRANS_GEMM_GRAPH_MODE");
+    return value != nullptr && std::strcmp(value, "group") == 0;
+  }();
+  return enabled;
 }
 
 bool graph_debug_force_sync_async() {
-  const char *value = std::getenv("ECTRANS_GEMM_DEBUG_SYNC_ASYNC");
-  return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+  static const bool enabled = [] {
+    const char *value = std::getenv("ECTRANS_GEMM_DEBUG_SYNC_ASYNC");
+    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+  }();
+  return enabled;
 }
 
 const char *graph_debug_rank() {
@@ -146,23 +152,29 @@ template <typename Gemm> auto &get_signature_cache() {
   static std::unordered_map<cache_key, uint64_t> signatureCache;
   return signatureCache;
 }
+template <typename Gemm> auto &get_graph_warmup_cache() {
+  static std::unordered_map<cache_key, bool> warmupCache;
+  return warmupCache;
+}
 
 template <typename Gemm> void free_gemm_graph_cache(float *, size_t) {
   if (graph_debug_enabled()) {
     std::fprintf(stderr,
                  "EC_GRAPH_DEBUG event=cache_clear reason=allocator rank=%s "
                  "pid=%ld precision=%s graph_entries=%zu ptr_entries=%zu "
-                 "signature_entries=%zu\n",
+                 "signature_entries=%zu warmup_entries=%zu\n",
                  graph_debug_rank(), static_cast<long>(getpid()),
                  std::is_same<typename Gemm::real_type, double>::value ? "f64"
                                                                        : "f32",
                  get_graph_cache<Gemm>().size(), get_ptr_cache<Gemm>().size(),
-                 get_signature_cache<Gemm>().size());
+                 get_signature_cache<Gemm>().size(),
+                 get_graph_warmup_cache<Gemm>().size());
     std::fflush(stderr);
   }
   get_graph_cache<Gemm>().clear();
   get_ptr_cache<Gemm>().clear();
   get_signature_cache<Gemm>().clear();
+  get_graph_warmup_cache<Gemm>().clear();
 }
 template <typename Cache>
 void erase_resol_from_cache(Cache &cache, int resol_id) {
@@ -181,18 +193,20 @@ template <typename Gemm> void erase_from_caches(int resol_id) {
     std::fprintf(stderr,
                  "EC_GRAPH_DEBUG event=cache_clear reason=resolution rank=%s "
                  "pid=%ld precision=%s resol=%d graph_entries=%zu "
-                 "ptr_entries=%zu signature_entries=%zu\n",
+                 "ptr_entries=%zu signature_entries=%zu warmup_entries=%zu\n",
                  graph_debug_rank(), static_cast<long>(getpid()),
                  std::is_same<typename Gemm::real_type, double>::value ? "f64"
                                                                        : "f32",
                  resol_id, get_graph_cache<Gemm>().size(),
                  get_ptr_cache<Gemm>().size(),
-                 get_signature_cache<Gemm>().size());
+                 get_signature_cache<Gemm>().size(),
+                 get_graph_warmup_cache<Gemm>().size());
     std::fflush(stderr);
   }
   erase_resol_from_cache(get_graph_cache<Gemm>(), resol_id);
   erase_resol_from_cache(get_ptr_cache<Gemm>(), resol_id);
   erase_resol_from_cache(get_signature_cache<Gemm>(), resol_id);
+  erase_resol_from_cache(get_graph_warmup_cache<Gemm>(), resol_id);
 }
 
 // this version is using graphs and caches the graphs
@@ -204,8 +218,9 @@ void run_group_graph(Gemm &&gemm, int resol_id, int m, const int *n,
                      const int64_t *offsetsC, int batchCount,
                      hipStream_t stream, int blas_id, void *growing_allocator,
                      bool synchronize = true) {
-  const auto callStart = graph_debug_clock::now();
   const bool debug = graph_debug_enabled();
+  const auto callStart =
+      debug ? graph_debug_clock::now() : graph_debug_clock::time_point{};
   const uint64_t sequence = debug ? ++graph_debug_sequence : 0;
   const uint64_t signature =
       debug ? graph_debug_signature(m, n, k, lda, offsetsA, ldb, offsetsB,
@@ -250,10 +265,12 @@ void run_group_graph(Gemm &&gemm, int resol_id, int m, const int *n,
 
   auto graph = graphCache.find(key);
   const bool cacheMiss = graph == graphCache.end();
-  const auto cachedSignature = signatureCache.find(key);
-  const bool signatureChange =
-      debug && !cacheMiss && cachedSignature != signatureCache.end() &&
-      cachedSignature->second != signature;
+  bool signatureChange = false;
+  if (debug && !cacheMiss) {
+    const auto cachedSignature = signatureCache.find(key);
+    signatureChange = cachedSignature != signatureCache.end() &&
+                      cachedSignature->second != signature;
+  }
   if (debug) {
     std::fprintf(
         stderr,
@@ -273,10 +290,12 @@ void run_group_graph(Gemm &&gemm, int resol_id, int m, const int *n,
 
   if (graph == graphCache.end()) {
     // this graph does not exist yet
-    const auto createStart = graph_debug_clock::now();
+    const auto createStart =
+        debug ? graph_debug_clock::now() : graph_debug_clock::time_point{};
     hipStream_t captureStream;
     HIC_CHECK(hipStreamCreate(&captureStream));
-    const auto createEnd = graph_debug_clock::now();
+    const auto createEnd =
+        debug ? graph_debug_clock::now() : graph_debug_clock::time_point{};
     std::size_t graphNodes = 0;
     auto beginStart = createEnd;
     auto beginEnd = createEnd;
@@ -300,16 +319,21 @@ void run_group_graph(Gemm &&gemm, int resol_id, int m, const int *n,
       HIC_CHECK(
           hipGraphAddChildGraphNode(&my_node, new_graph, nullptr, 0, my_graph));
     }
-    HIC_CHECK(hipGraphGetNodes(new_graph, nullptr, &graphNodes));
-    const auto instantiateStart = graph_debug_clock::now();
+    if (debug)
+      HIC_CHECK(hipGraphGetNodes(new_graph, nullptr, &graphNodes));
+    const auto instantiateStart =
+        debug ? graph_debug_clock::now() : graph_debug_clock::time_point{};
     hipGraphExec_t instance;
     HIC_CHECK(hipGraphInstantiate(&instance, new_graph, NULL, NULL, 0));
-    instantiateEnd = graph_debug_clock::now();
+    if (debug)
+      instantiateEnd = graph_debug_clock::now();
     HIC_CHECK(hipGraphDestroy(new_graph));
 #else
-    beginStart = graph_debug_clock::now();
+    if (debug)
+      beginStart = graph_debug_clock::now();
     HIC_CHECK(hipStreamBeginCapture(captureStream, hipStreamCaptureModeGlobal));
-    beginEnd = graph_debug_clock::now();
+    if (debug)
+      beginEnd = graph_debug_clock::now();
     for (int i = 0; i < batchCount; ++i) {
       if (m == 0 || n[i] == 0 || k[i] == 0)
         continue;
@@ -317,19 +341,26 @@ void run_group_graph(Gemm &&gemm, int resol_id, int m, const int *n,
       gemm(captureStream, m, n[i], k[i], alpha, A + offsetsA[i], lda, B + offsetsB[i],
            ldb[i], beta, C + offsetsC[i], ldc);
     }
-    enqueueEnd = graph_debug_clock::now();
+    if (debug)
+      enqueueEnd = graph_debug_clock::now();
     hipGraph_t my_graph;
     HIC_CHECK(hipStreamEndCapture(captureStream, &my_graph));
-    captureEnd = graph_debug_clock::now();
-    HIC_CHECK(hipGraphGetNodes(my_graph, nullptr, &graphNodes));
-    const auto instantiateStart = graph_debug_clock::now();
+    if (debug) {
+      captureEnd = graph_debug_clock::now();
+      HIC_CHECK(hipGraphGetNodes(my_graph, nullptr, &graphNodes));
+    }
+    const auto instantiateStart =
+        debug ? graph_debug_clock::now() : graph_debug_clock::time_point{};
     hipGraphExec_t instance;
     HIC_CHECK(hipGraphInstantiate(&instance, my_graph, NULL, NULL, 0));
-    instantiateEnd = graph_debug_clock::now();
+    if (debug)
+      instantiateEnd = graph_debug_clock::now();
 #endif
-    const auto destroyStart = graph_debug_clock::now();
+    const auto destroyStart =
+        debug ? graph_debug_clock::now() : graph_debug_clock::time_point{};
     HIC_CHECK(hipStreamDestroy(captureStream));
-    const auto destroyEnd = graph_debug_clock::now();
+    const auto destroyEnd =
+        debug ? graph_debug_clock::now() : graph_debug_clock::time_point{};
 
     graphCache.insert({key, std::shared_ptr<hipGraphExec_t>(
                                 new hipGraphExec_t{instance}, [](auto ptr) {
@@ -361,13 +392,16 @@ void run_group_graph(Gemm &&gemm, int resol_id, int m, const int *n,
     }
   }
 
-  const auto launchStart = graph_debug_clock::now();
+  const auto launchStart =
+      debug ? graph_debug_clock::now() : graph_debug_clock::time_point{};
   HIC_CHECK(hipGraphLaunch(*graphCache.at(key), stream));
-  const auto launchEnd = graph_debug_clock::now();
+  const auto launchEnd =
+      debug ? graph_debug_clock::now() : graph_debug_clock::time_point{};
   auto syncEnd = launchEnd;
   if (synchronize)
     HIC_CHECK(hipStreamSynchronize(stream));
-  syncEnd = graph_debug_clock::now();
+  if (debug)
+    syncEnd = graph_debug_clock::now();
   if (debug) {
     std::fprintf(stderr,
                  "EC_GRAPH_DEBUG event=return mode=graph rank=%s pid=%ld "
@@ -391,8 +425,9 @@ void run_group(Gemm &&gemm, int resol_id, int m, const int *n, const int *k,
                Real beta, Real *C, int ldc, const int64_t *offsetsC,
                int batchCount, hipStream_t stream, int blas_id = -1,
                bool synchronize = true) {
-  const auto callStart = graph_debug_clock::now();
   const bool debug = graph_debug_enabled();
+  const auto callStart =
+      debug ? graph_debug_clock::now() : graph_debug_clock::time_point{};
   const uint64_t sequence = debug ? ++graph_debug_sequence : 0;
   const uint64_t signature =
       debug ? graph_debug_signature(m, n, k, lda, offsetsA, ldb, offsetsB,
@@ -400,17 +435,20 @@ void run_group(Gemm &&gemm, int resol_id, int m, const int *n, const int *k,
             : 0;
   const int activeGroups =
       debug ? graph_debug_active_groups(m, n, k, batchCount) : 0;
-  const auto enqueueStart = graph_debug_clock::now();
+  const auto enqueueStart =
+      debug ? graph_debug_clock::now() : graph_debug_clock::time_point{};
   for (int i = 0; i < batchCount; ++i) {
     if (m == 0 || n[i] == 0 || k[i] == 0)
       continue;
     gemm(stream, m, n[i], k[i], alpha, A + offsetsA[i], lda, B + offsetsB[i],
          ldb[i], beta, C + offsetsC[i], ldc);
   }
-  const auto enqueueEnd = graph_debug_clock::now();
+  const auto enqueueEnd =
+      debug ? graph_debug_clock::now() : graph_debug_clock::time_point{};
   if (synchronize)
     HIC_CHECK(hipStreamSynchronize(stream));
-  const auto syncEnd = graph_debug_clock::now();
+  const auto syncEnd =
+      debug ? graph_debug_clock::now() : graph_debug_clock::time_point{};
   if (debug) {
     std::fprintf(
         stderr,
@@ -519,7 +557,18 @@ void hipblas_dgemm_wrapper_grouped(int resol_id, int blas_id, char transa,
     op_t2 = HIPBLAS_OP_T;
 
 #ifdef USE_GRAPHS_GEMM
-  if (graph_debug_force_group())
+  const auto key = cache_key{resol_id, m, blas_id};
+  const bool forceGroup = graph_debug_force_group();
+  const bool firstCall =
+      !forceGroup && get_graph_warmup_cache<hipblas_gemm_grouped<double>>()
+                         .emplace(key, true)
+                         .second;
+  if (firstCall)
+    growing_allocator_register_free_c(
+        growing_allocator,
+        free_gemm_graph_cache<hipblas_gemm_grouped<double>>);
+  // Submit the cold HIPBLAS kernels normally before capturing this plan.
+  if (forceGroup || firstCall)
     run_group(hipblas_gemm_grouped<double>(op_t1, op_t2), resol_id, m, n, k,
               alpha, A, lda, offsetsA, B, ldb, offsetsB, beta, C, ldc,
               offsetsC, batchCount, stream, blas_id, synchronize);
