@@ -628,8 +628,10 @@ if (lspectral_device_cache) then
   !$ACC ENTER DATA COPYIN(zspvor,zspdiv)
   if (icall_mode == 1) then
     !$ACC ENTER DATA COPYIN(zspscalar)
+    !$ACC ENTER DATA CREATE(zgp)
   else
     !$ACC ENTER DATA COPYIN(zspsc3a,zspsc2)
+    !$ACC ENTER DATA CREATE(zgpuv,zgp3a,zgp2)
   endif
 endif
 #endif
@@ -802,8 +804,10 @@ enddo
 #ifdef _OPENACC
 if (lspectral_device_cache) then
   if (icall_mode == 1) then
+    !$ACC EXIT DATA DELETE(zgp)
     !$ACC EXIT DATA COPYOUT(zspscalar)
   else
+    !$ACC EXIT DATA DELETE(zgpuv,zgp3a,zgp2)
     !$ACC EXIT DATA COPYOUT(zspsc3a,zspsc2)
   endif
   !$ACC EXIT DATA COPYOUT(zspvor,zspdiv)
