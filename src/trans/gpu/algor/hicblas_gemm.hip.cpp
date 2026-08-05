@@ -18,6 +18,7 @@
 #include <cstring>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <type_traits>
 #include <unordered_map>
 #include <unistd.h>
@@ -32,15 +33,11 @@
 
 #include "growing_allocator.h"
 
-bool hip_alreadyAllocated_sgemm = false;
-bool hip_alreadyAllocated_sgemm_handle = false;
-
-hipblasHandle_t handle_hip_sgemm;
-
 namespace {
 using graph_debug_clock = std::chrono::steady_clock;
 
 std::atomic<uint64_t> graph_debug_sequence{0};
+std::mutex growing_allocator_registration_mutex;
 
 bool graph_debug_enabled() {
   static const bool enabled = [] {
@@ -280,21 +277,44 @@ cache_key<Real> make_cache_key(
                          batchCount};
 }
 
-template <typename Gemm> auto &get_graph_cache() {
+class graph_exec_entry {
+public:
+  explicit graph_exec_entry(hipGraphExec_t graph) : graph_(graph) {}
+
+  ~graph_exec_entry() { HIC_CHECK(hipGraphExecDestroy(graph_)); }
+
+  graph_exec_entry(const graph_exec_entry &) = delete;
+  graph_exec_entry &operator=(const graph_exec_entry &) = delete;
+
+  void launch(hipStream_t stream) {
+    std::lock_guard<std::mutex> lock(launch_mutex_);
+    HIC_CHECK(hipGraphLaunch(graph_, stream));
+  }
+
+private:
+  hipGraphExec_t graph_;
+  std::mutex launch_mutex_;
+};
+
+template <typename Gemm> struct graph_cache_state {
   using real_t = typename Gemm::real_type;
-  static std::unordered_map<cache_key<real_t>, std::shared_ptr<hipGraphExec_t>,
-                            cache_key_hash<real_t>>
-      graphCache;
-  return graphCache;
-}
-template <typename Gemm> auto &get_graph_warmup_cache() {
-  using real_t = typename Gemm::real_type;
-  static std::unordered_map<cache_key<real_t>, bool, cache_key_hash<real_t>>
-      warmupCache;
-  return warmupCache;
+
+  std::mutex mutex;
+  std::unordered_map<cache_key<real_t>, std::shared_ptr<graph_exec_entry>,
+                     cache_key_hash<real_t>>
+      graph_cache;
+  std::unordered_map<cache_key<real_t>, bool, cache_key_hash<real_t>>
+      warmup_cache;
+};
+
+template <typename Gemm> graph_cache_state<Gemm> &get_graph_cache_state() {
+  static graph_cache_state<Gemm> state;
+  return state;
 }
 
 template <typename Gemm> void free_gemm_graph_cache(float *, size_t) {
+  auto &state = get_graph_cache_state<Gemm>();
+  std::lock_guard<std::mutex> lock(state.mutex);
   if (graph_debug_enabled()) {
     std::fprintf(stderr,
                  "EC_GRAPH_DEBUG event=cache_clear reason=allocator rank=%s "
@@ -302,12 +322,11 @@ template <typename Gemm> void free_gemm_graph_cache(float *, size_t) {
                  graph_debug_rank(), static_cast<long>(getpid()),
                  std::is_same<typename Gemm::real_type, double>::value ? "f64"
                                                                        : "f32",
-                 get_graph_cache<Gemm>().size(),
-                 get_graph_warmup_cache<Gemm>().size());
+                 state.graph_cache.size(), state.warmup_cache.size());
     std::fflush(stderr);
   }
-  get_graph_cache<Gemm>().clear();
-  get_graph_warmup_cache<Gemm>().clear();
+  state.graph_cache.clear();
+  state.warmup_cache.clear();
 }
 template <typename Cache>
 void erase_resol_from_cache(Cache &cache, int resol_id) {
@@ -322,6 +341,8 @@ void erase_resol_from_cache(Cache &cache, int resol_id) {
   }
 }
 template <typename Gemm> void erase_from_caches(int resol_id) {
+  auto &state = get_graph_cache_state<Gemm>();
+  std::lock_guard<std::mutex> lock(state.mutex);
   if (graph_debug_enabled()) {
     std::fprintf(stderr,
                  "EC_GRAPH_DEBUG event=cache_clear reason=resolution rank=%s "
@@ -330,12 +351,12 @@ template <typename Gemm> void erase_from_caches(int resol_id) {
                  graph_debug_rank(), static_cast<long>(getpid()),
                  std::is_same<typename Gemm::real_type, double>::value ? "f64"
                                                                        : "f32",
-                 resol_id, get_graph_cache<Gemm>().size(),
-                 get_graph_warmup_cache<Gemm>().size());
+                 resol_id, state.graph_cache.size(),
+                 state.warmup_cache.size());
     std::fflush(stderr);
   }
-  erase_resol_from_cache(get_graph_cache<Gemm>(), resol_id);
-  erase_resol_from_cache(get_graph_warmup_cache<Gemm>(), resol_id);
+  erase_resol_from_cache(state.graph_cache, resol_id);
+  erase_resol_from_cache(state.warmup_cache, resol_id);
 }
 
 // this version is using graphs and caches the graphs
@@ -356,13 +377,22 @@ void run_group_graph(Gemm &&gemm, const cache_key<Real> &key, int m,
   const int activeGroups =
       debug ? graph_debug_active_groups(m, n, k, batchCount) : 0;
 
-  growing_allocator_register_free_c(growing_allocator,
-                                    free_gemm_graph_cache<Gemm>);
+  {
+    std::lock_guard<std::mutex> registration_lock(
+        growing_allocator_registration_mutex);
+    growing_allocator_register_free_c(growing_allocator,
+                                      free_gemm_graph_cache<Gemm>);
+  }
 
-  auto &graphCache = get_graph_cache<Gemm>();
+  auto &cacheState = get_graph_cache_state<Gemm>();
+  std::unique_lock<std::mutex> cacheLock(cacheState.mutex);
+  auto &graphCache = cacheState.graph_cache;
 
   auto graph = graphCache.find(key);
   const bool cacheMiss = graph == graphCache.end();
+  std::shared_ptr<graph_exec_entry> graphExec;
+  if (!cacheMiss)
+    graphExec = graph->second;
   if (debug) {
     std::fprintf(
         stderr,
@@ -462,11 +492,8 @@ void run_group_graph(Gemm &&gemm, const cache_key<Real> &key, int m,
     const auto destroyEnd =
         debug ? graph_debug_clock::now() : graph_debug_clock::time_point{};
 
-    graphCache.insert({key, std::shared_ptr<hipGraphExec_t>(
-                                new hipGraphExec_t{instance}, [](auto ptr) {
-                                  HIC_CHECK(hipGraphExecDestroy(*ptr));
-                                  delete ptr;
-                                })});
+    graphExec = std::make_shared<graph_exec_entry>(instance);
+    graphCache.emplace(key, graphExec);
     if (debug) {
       std::fprintf(
           stderr,
@@ -488,10 +515,11 @@ void run_group_graph(Gemm &&gemm, const cache_key<Real> &key, int m,
       std::fflush(stderr);
     }
   }
+  cacheLock.unlock();
 
   const auto launchStart =
       debug ? graph_debug_clock::now() : graph_debug_clock::time_point{};
-  HIC_CHECK(hipGraphLaunch(*graphCache.at(key), stream));
+  graphExec->launch(stream);
   const auto launchEnd =
       debug ? graph_debug_clock::now() : graph_debug_clock::time_point{};
   auto syncEnd = launchEnd;
@@ -569,11 +597,45 @@ void run_group(Gemm &&gemm, int resol_id, int m, const int *n, const int *k,
 #include "hicblas_cutlass.cuda.h"
 #endif
 
+class hipblas_handle_owner {
+public:
+  explicit hipblas_handle_owner(int device) : device_(device) {
+    HICBLAS_CHECK(hipblasCreate(&handle_));
+  }
+
+  ~hipblas_handle_owner() {
+    int current_device;
+    HIC_CHECK(hipGetDevice(&current_device));
+    if (current_device != device_)
+      HIC_CHECK(hipSetDevice(device_));
+    HICBLAS_CHECK(hipblasDestroy(handle_));
+    if (current_device != device_)
+      HIC_CHECK(hipSetDevice(current_device));
+  }
+
+  hipblas_handle_owner(const hipblas_handle_owner &) = delete;
+  hipblas_handle_owner &operator=(const hipblas_handle_owner &) = delete;
+
+  hipblasHandle_t get() const { return handle_; }
+
+private:
+  int device_;
+  hipblasHandle_t handle_;
+};
+
 hipblasHandle_t get_hipblas_handle() {
-  static hipblasHandle_t handle;
-  if (!handle)
-    HICBLAS_CHECK(hipblasCreate(&handle));
-  return handle;
+  int device;
+  HIC_CHECK(hipGetDevice(&device));
+  thread_local std::unordered_map<int, std::unique_ptr<hipblas_handle_owner>>
+      handles;
+  auto handle = handles.find(device);
+  if (handle == handles.end()) {
+    handle = handles
+                 .emplace(device,
+                          std::make_unique<hipblas_handle_owner>(device))
+                 .first;
+  }
+  return handle->second->get();
 }
 template <typename Real> struct hipblas_gemm_grouped {
 public:
@@ -664,24 +726,35 @@ void hipblas_dgemm_wrapper_grouped(int resol_id, int blas_id, char transa,
       k, alpha, A, lda, offsetsA, B, ldb, offsetsB, beta, C, ldc, offsetsC,
       batchCount);
   const bool forceGroup = graph_debug_force_group();
-  const bool firstCall =
-      !forceGroup && get_graph_warmup_cache<hipblas_gemm_grouped<double>>()
-                         .emplace(key, true)
-                         .second;
-  if (firstCall)
-    growing_allocator_register_free_c(
-        growing_allocator,
-        free_gemm_graph_cache<hipblas_gemm_grouped<double>>);
-  // Submit the cold HIPBLAS kernels normally before capturing this plan.
-  if (forceGroup || firstCall)
+  if (forceGroup) {
     run_group(hipblas_gemm_grouped<double>(op_t1, op_t2), resol_id, m, n, k,
               alpha, A, lda, offsetsA, B, ldb, offsetsB, beta, C, ldc,
               offsetsC, batchCount, stream, blas_id, synchronize);
-  else
-    run_group_graph(hipblas_gemm_grouped<double>(op_t1, op_t2), key, m, n, k,
-                    alpha, A, lda, offsetsA, B, ldb, offsetsB, beta, C, ldc,
-                    offsetsC, batchCount, stream, growing_allocator,
-                    synchronize);
+  } else {
+    {
+      std::lock_guard<std::mutex> registration_lock(
+          growing_allocator_registration_mutex);
+      growing_allocator_register_free_c(
+          growing_allocator,
+          free_gemm_graph_cache<hipblas_gemm_grouped<double>>);
+    }
+    auto &cacheState =
+        get_graph_cache_state<hipblas_gemm_grouped<double>>();
+    std::unique_lock<std::mutex> cacheLock(cacheState.mutex);
+    const bool firstCall = cacheState.warmup_cache.emplace(key, true).second;
+    // Keep this plan locked until its cold HIPBLAS submission has completed.
+    if (firstCall) {
+      run_group(hipblas_gemm_grouped<double>(op_t1, op_t2), resol_id, m, n, k,
+                alpha, A, lda, offsetsA, B, ldb, offsetsB, beta, C, ldc,
+                offsetsC, batchCount, stream, blas_id, synchronize);
+    } else {
+      cacheLock.unlock();
+      run_group_graph(hipblas_gemm_grouped<double>(op_t1, op_t2), key, m, n,
+                      k, alpha, A, lda, offsetsA, B, ldb, offsetsB, beta, C,
+                      ldc, offsetsC, batchCount, stream, growing_allocator,
+                      synchronize);
+    }
+  }
 #else
   run_group(hipblas_gemm_grouped<double>(op_t1, op_t2), resol_id, m, n, k,
             alpha, A, lda, offsetsA, B, ldb, offsetsB, beta, C, ldc, offsetsC,
@@ -726,14 +799,11 @@ void hipblas_sgemm_wrapper(char transa, char transb, int m, int n, int k,
   if (transb == 'T' || transb == 't')
     op_t2 = HIPBLAS_OP_T;
 
-  if (!hip_alreadyAllocated_sgemm_handle) {
-    HICBLAS_CHECK(hipblasCreate(&handle_hip_sgemm));
-    hip_alreadyAllocated_sgemm_handle = true;
-  }
+  hipblasHandle_t handle = get_hipblas_handle();
+  HICBLAS_CHECK(hipblasSetStream(handle, nullptr));
   HICBLAS_CHECK(hipblasSgemmStridedBatched(
-      handle_hip_sgemm, op_t1, op_t2, m, n, k, &alpha, (const float *)A, lda,
-      tda, (const float *)B, ldb, tdb, &beta, (float *)C, ldc, tdc,
-      batchCount));
+      handle, op_t1, op_t2, m, n, k, &alpha, (const float *)A, lda, tda,
+      (const float *)B, ldb, tdb, &beta, (float *)C, ldc, tdc, batchCount));
 }
 
 void hipblas_sgemm_wrapper_grouped(
