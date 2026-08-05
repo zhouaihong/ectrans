@@ -167,17 +167,21 @@ void cutlass_sgemm_wrapper_grouped_op(int resol_id, int blas_id, int m, const in
   int capability_major;
   HIC_CHECK(cudaDeviceGetAttribute(&capability_major,
                                     cudaDevAttrComputeCapabilityMajor, device));
+  const auto key = make_cache_key(
+      resol_id, blas_id, static_cast<int>(TransA), static_cast<int>(TransB), m,
+      n, k, alpha, A, lda, offsetsA, B, ldb, offsetsB, beta, C, ldc, offsetsC,
+      batchCount);
   if (capability_major >= 8 && use_3xtf32)
     run_group_graph(cutlass_sgemm_grouped<detail::CutlassType::cutlass_3xtf32,
                                           TransA, TransB>(),
-                    resol_id, m, n, k, alpha, A, lda, offsetsA, B, ldb, offsetsB, beta, C,
-                    ldc, offsetsC, batchCount, stream, blas_id,
+                    key, m, n, k, alpha, A, lda, offsetsA, B, ldb, offsetsB, beta, C,
+                    ldc, offsetsC, batchCount, stream,
                     growing_allocator);
   else
     run_group_graph(cutlass_sgemm_grouped<detail::CutlassType::cutlass_fp32,
                                           TransA, TransB>(),
-                    resol_id, m, n, k, alpha, A, lda, offsetsA, B, ldb, offsetsB, beta, C,
-                    ldc, offsetsC, batchCount, stream, blas_id,
+                    key, m, n, k, alpha, A, lda, offsetsA, B, ldb, offsetsB, beta, C,
+                    ldc, offsetsC, batchCount, stream,
                     growing_allocator);
 }
 

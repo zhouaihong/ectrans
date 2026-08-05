@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cinttypes>
@@ -20,8 +21,11 @@
 #include <type_traits>
 #include <unordered_map>
 #include <unistd.h>
+#include <utility>
+#include <vector>
 
 #include "hicblas.h"
+#include "hicgraph.h"
 #ifdef USE_CUTLASS
 #include "cutlass/gemm/device/gemm.h"
 #endif
@@ -115,45 +119,178 @@ int graph_debug_active_groups(int m, const int *n, const int *k,
   return active;
 }
 
-struct cache_key {
-  int resol_id;
-  int m;
-  int blas_id;
+template <typename T> class graph_key_array {
+public:
+  graph_key_array(const T *data, std::size_t size)
+      : data_(size == 0 ? nullptr : data), size_(size) {}
+
+  graph_key_array(const graph_key_array &other) { copy_from(other); }
+
+  graph_key_array(graph_key_array &&other) noexcept { move_from(other); }
+
+  graph_key_array &operator=(const graph_key_array &other) {
+    if (this != &other)
+      copy_from(other);
+    return *this;
+  }
+
+  graph_key_array &operator=(graph_key_array &&other) noexcept {
+    if (this != &other)
+      move_from(other);
+    return *this;
+  }
+
+  bool operator==(const graph_key_array &other) const {
+    return size_ == other.size_ &&
+           (size_ == 0 || std::equal(data_, data_ + size_, other.data_));
+  }
+
+  uint64_t add_to_hash(uint64_t hash) const {
+    for (std::size_t i = 0; i < size_; ++i)
+      hash = graph_debug_hash_value(hash, data_[i]);
+    return hash;
+  }
+
+private:
+  void copy_from(const graph_key_array &other) {
+    size_ = other.size_;
+    owned_.clear();
+    if (size_ != 0)
+      owned_.assign(other.data_, other.data_ + size_);
+    data_ = owned_.empty() ? nullptr : owned_.data();
+  }
+
+  void move_from(graph_key_array &other) {
+    size_ = other.size_;
+    if (other.owned_.empty()) {
+      owned_.clear();
+      if (size_ != 0)
+        owned_.assign(other.data_, other.data_ + size_);
+    } else {
+      owned_ = std::move(other.owned_);
+    }
+    data_ = owned_.empty() ? nullptr : owned_.data();
+  }
+
+  std::vector<T> owned_;
+  const T *data_ = nullptr;
+  std::size_t size_ = 0;
+};
+
+template <typename Real> struct cache_key {
+  cache_key(int resol_id_, int blas_id_, int device_id_, int transa_,
+            int transb_, int m_, const int *n_, const int *k_, Real alpha_,
+            const Real *A_, int lda_, const int64_t *offsetsA_, const Real *B_,
+            const int *ldb_, const int64_t *offsetsB_, Real beta_, Real *C_,
+            int ldc_, const int64_t *offsetsC_, int batchCount_)
+      : resol_id(resol_id_), blas_id(blas_id_), device_id(device_id_),
+        transa(transa_), transb(transb_), m(m_), lda(lda_), ldc(ldc_),
+        batchCount(batchCount_), alphaBits(real_bits(alpha_)),
+        betaBits(real_bits(beta_)), A(A_), B(B_), C(C_),
+        n(n_, batchCount_), k(k_, batchCount_), ldb(ldb_, batchCount_),
+        offsetsA(offsetsA_, batchCount_), offsetsB(offsetsB_, batchCount_),
+        offsetsC(offsetsC_, batchCount_) {
+    signature = calculate_signature();
+  }
 
   bool operator==(const cache_key &other) const {
-    return resol_id == other.resol_id && m == other.m &&
-           blas_id == other.blas_id;
+    return resol_id == other.resol_id && blas_id == other.blas_id &&
+           device_id == other.device_id && transa == other.transa &&
+           transb == other.transb && m == other.m && lda == other.lda &&
+           ldc == other.ldc && batchCount == other.batchCount &&
+           alphaBits == other.alphaBits && betaBits == other.betaBits &&
+           A == other.A && B == other.B && C == other.C && n == other.n &&
+           k == other.k && ldb == other.ldb && offsetsA == other.offsetsA &&
+           offsetsB == other.offsetsB && offsetsC == other.offsetsC;
   }
-  cache_key(int resol_id_, int m_, int blas_id_)
-      : resol_id(resol_id_), m(m_), blas_id(blas_id_) {}
-};
-} // namespace
-template <> struct std::hash<cache_key> {
-  std::size_t operator()(const cache_key &k) const {
-    return k.blas_id * 1000000 + k.resol_id * 10000 + k.m;
+
+  int resol_id;
+  int blas_id;
+  int device_id;
+  int transa;
+  int transb;
+  int m;
+  int lda;
+  int ldc;
+  int batchCount;
+  uint64_t alphaBits;
+  uint64_t betaBits;
+  const Real *A;
+  const Real *B;
+  Real *C;
+  graph_key_array<int> n;
+  graph_key_array<int> k;
+  graph_key_array<int> ldb;
+  graph_key_array<int64_t> offsetsA;
+  graph_key_array<int64_t> offsetsB;
+  graph_key_array<int64_t> offsetsC;
+  uint64_t signature;
+
+private:
+  static uint64_t real_bits(Real value) {
+    static_assert(sizeof(Real) <= sizeof(uint64_t));
+    uint64_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(value));
+    return bits;
+  }
+
+  uint64_t calculate_signature() const {
+    uint64_t hash = UINT64_C(1469598103934665603);
+    hash = graph_debug_hash_value(hash, resol_id);
+    hash = graph_debug_hash_value(hash, blas_id);
+    hash = graph_debug_hash_value(hash, device_id);
+    hash = graph_debug_hash_value(hash, transa);
+    hash = graph_debug_hash_value(hash, transb);
+    hash = graph_debug_hash_value(hash, m);
+    hash = graph_debug_hash_value(hash, lda);
+    hash = graph_debug_hash_value(hash, ldc);
+    hash = graph_debug_hash_value(hash, batchCount);
+    hash = graph_debug_hash_value(hash, alphaBits);
+    hash = graph_debug_hash_value(hash, betaBits);
+    hash = graph_debug_hash_value(hash, A);
+    hash = graph_debug_hash_value(hash, B);
+    hash = graph_debug_hash_value(hash, C);
+    hash = n.add_to_hash(hash);
+    hash = k.add_to_hash(hash);
+    hash = ldb.add_to_hash(hash);
+    hash = offsetsA.add_to_hash(hash);
+    hash = offsetsB.add_to_hash(hash);
+    return offsetsC.add_to_hash(hash);
   }
 };
 
-namespace {
+template <typename Real> struct cache_key_hash {
+  std::size_t operator()(const cache_key<Real> &key) const {
+    return static_cast<std::size_t>(key.signature);
+  }
+};
+
+template <typename Real>
+cache_key<Real> make_cache_key(
+    int resol_id, int blas_id, int transa, int transb, int m, const int *n,
+    const int *k, Real alpha, const Real *A, int lda, const int64_t *offsetsA,
+    const Real *B, const int *ldb, const int64_t *offsetsB, Real beta, Real *C,
+    int ldc, const int64_t *offsetsC, int batchCount) {
+  int device_id;
+  HIC_CHECK(hipGetDevice(&device_id));
+  return cache_key<Real>{resol_id, blas_id, device_id, transa, transb,
+                         m,        n,       k,         alpha,  A,
+                         lda,      offsetsA, B,        ldb,    offsetsB,
+                         beta,     C,       ldc,       offsetsC,
+                         batchCount};
+}
+
 template <typename Gemm> auto &get_graph_cache() {
-  // we store at most one graph per "m" (# fields) and "blas id" and resolution
-  static std::unordered_map<cache_key, std::shared_ptr<hipGraphExec_t>>
+  using real_t = typename Gemm::real_type;
+  static std::unordered_map<cache_key<real_t>, std::shared_ptr<hipGraphExec_t>,
+                            cache_key_hash<real_t>>
       graphCache;
   return graphCache;
 }
-template <typename Gemm> auto &get_ptr_cache() {
-  using real_t = typename Gemm::real_type;
-  static std::unordered_map<
-      cache_key, std::tuple<const real_t *, const real_t *, const real_t *>>
-      ptrCache;
-  return ptrCache;
-}
-template <typename Gemm> auto &get_signature_cache() {
-  static std::unordered_map<cache_key, uint64_t> signatureCache;
-  return signatureCache;
-}
 template <typename Gemm> auto &get_graph_warmup_cache() {
-  static std::unordered_map<cache_key, bool> warmupCache;
+  using real_t = typename Gemm::real_type;
+  static std::unordered_map<cache_key<real_t>, bool, cache_key_hash<real_t>>
+      warmupCache;
   return warmupCache;
 }
 
@@ -161,19 +298,15 @@ template <typename Gemm> void free_gemm_graph_cache(float *, size_t) {
   if (graph_debug_enabled()) {
     std::fprintf(stderr,
                  "EC_GRAPH_DEBUG event=cache_clear reason=allocator rank=%s "
-                 "pid=%ld precision=%s graph_entries=%zu ptr_entries=%zu "
-                 "signature_entries=%zu warmup_entries=%zu\n",
+                 "pid=%ld precision=%s graph_entries=%zu warmup_entries=%zu\n",
                  graph_debug_rank(), static_cast<long>(getpid()),
                  std::is_same<typename Gemm::real_type, double>::value ? "f64"
                                                                        : "f32",
-                 get_graph_cache<Gemm>().size(), get_ptr_cache<Gemm>().size(),
-                 get_signature_cache<Gemm>().size(),
+                 get_graph_cache<Gemm>().size(),
                  get_graph_warmup_cache<Gemm>().size());
     std::fflush(stderr);
   }
   get_graph_cache<Gemm>().clear();
-  get_ptr_cache<Gemm>().clear();
-  get_signature_cache<Gemm>().clear();
   get_graph_warmup_cache<Gemm>().clear();
 }
 template <typename Cache>
@@ -193,96 +326,54 @@ template <typename Gemm> void erase_from_caches(int resol_id) {
     std::fprintf(stderr,
                  "EC_GRAPH_DEBUG event=cache_clear reason=resolution rank=%s "
                  "pid=%ld precision=%s resol=%d graph_entries=%zu "
-                 "ptr_entries=%zu signature_entries=%zu warmup_entries=%zu\n",
+                 "warmup_entries=%zu\n",
                  graph_debug_rank(), static_cast<long>(getpid()),
                  std::is_same<typename Gemm::real_type, double>::value ? "f64"
                                                                        : "f32",
                  resol_id, get_graph_cache<Gemm>().size(),
-                 get_ptr_cache<Gemm>().size(),
-                 get_signature_cache<Gemm>().size(),
                  get_graph_warmup_cache<Gemm>().size());
     std::fflush(stderr);
   }
   erase_resol_from_cache(get_graph_cache<Gemm>(), resol_id);
-  erase_resol_from_cache(get_ptr_cache<Gemm>(), resol_id);
-  erase_resol_from_cache(get_signature_cache<Gemm>(), resol_id);
   erase_resol_from_cache(get_graph_warmup_cache<Gemm>(), resol_id);
 }
 
 // this version is using graphs and caches the graphs
 template <typename Gemm, typename Real>
-void run_group_graph(Gemm &&gemm, int resol_id, int m, const int *n,
+void run_group_graph(Gemm &&gemm, const cache_key<Real> &key, int m,
+                     const int *n,
                      const int *k, Real alpha, const Real *A, int lda,
                      const int64_t *offsetsA, const Real *B, const int *ldb,
                      const int64_t *offsetsB, Real beta, Real *C, int ldc,
                      const int64_t *offsetsC, int batchCount,
-                     hipStream_t stream, int blas_id, void *growing_allocator,
+                     hipStream_t stream, void *growing_allocator,
                      bool synchronize = true) {
   const bool debug = graph_debug_enabled();
   const auto callStart =
       debug ? graph_debug_clock::now() : graph_debug_clock::time_point{};
   const uint64_t sequence = debug ? ++graph_debug_sequence : 0;
-  const uint64_t signature =
-      debug ? graph_debug_signature(m, n, k, lda, offsetsA, ldb, offsetsB,
-                                    ldc, offsetsC, batchCount)
-            : 0;
+  const uint64_t signature = key.signature;
   const int activeGroups =
       debug ? graph_debug_active_groups(m, n, k, batchCount) : 0;
 
   growing_allocator_register_free_c(growing_allocator,
                                     free_gemm_graph_cache<Gemm>);
 
-  // we store at most one graph per "m" (# fields) and "blas id"
   auto &graphCache = get_graph_cache<Gemm>();
-
-  // we also store A, B, and C and recreate the graph if they change
-  auto &ptrCache = get_ptr_cache<Gemm>();
-  auto &signatureCache = get_signature_cache<Gemm>();
-
-  auto key = cache_key{resol_id, m, blas_id};
-
-  auto ptrs = ptrCache.find(key);
-  const bool pointerChange =
-      ptrs != ptrCache.end() &&
-      (std::get<0>(ptrs->second) != A || std::get<1>(ptrs->second) != B ||
-       std::get<2>(ptrs->second) != C);
-  if (pointerChange) {
-    // the plan is cached, but the pointers are not correct. we remove and
-    // delete the graph, but we keep the hipblas handles, if this happens more
-    // often, we should cache this...
-    std::cout
-        << "WARNING GEMM: POINTER CHANGE - Graph recreation might be slow."
-        << std::endl;
-    std::cout << "We have an entry with key {m=" << m << ", blas_id=" << blas_id
-              << ", resol_id=" << resol_id << "}\n";
-    std::cout << "Pointers: " << std::get<0>(ptrs->second) << ", "
-              << std::get<1>(ptrs->second) << ", " << std::get<2>(ptrs->second)
-              << " vs. " << A << ", " << B << ", " << C << std::endl;
-    graphCache.erase(key);
-    ptrCache.erase(key);
-    signatureCache.erase(key);
-  }
 
   auto graph = graphCache.find(key);
   const bool cacheMiss = graph == graphCache.end();
-  bool signatureChange = false;
-  if (debug && !cacheMiss) {
-    const auto cachedSignature = signatureCache.find(key);
-    signatureChange = cachedSignature != signatureCache.end() &&
-                      cachedSignature->second != signature;
-  }
   if (debug) {
     std::fprintf(
         stderr,
         "EC_GRAPH_DEBUG event=call mode=graph rank=%s pid=%ld seq=%" PRIu64
-        " precision=%s resol=%d m=%d blas=%d batch=%d active=%d "
-        "signature=%016" PRIx64 " cache=%s pointer_change=%d "
-        "signature_change=%d graph_entries=%zu stream=%p A=%p B=%p C=%p\n",
+        " precision=%s resol=%d m=%d blas=%d device=%d transa=%d transb=%d "
+        "batch=%d active=%d signature=%016" PRIx64
+        " cache=%s graph_entries=%zu stream=%p A=%p B=%p C=%p\n",
         graph_debug_rank(), static_cast<long>(getpid()), sequence,
-        std::is_same<Real, double>::value ? "f64" : "f32", resol_id, m,
-        blas_id, batchCount, activeGroups, signature,
-        cacheMiss ? "miss" : "hit", pointerChange ? 1 : 0,
-        signatureChange ? 1 : 0, graphCache.size(),
+        std::is_same<Real, double>::value ? "f64" : "f32", key.resol_id, m,
+        key.blas_id, key.device_id, key.transa, key.transb, batchCount,
+        activeGroups, signature, cacheMiss ? "miss" : "hit", graphCache.size(),
         reinterpret_cast<void *>(stream), static_cast<const void *>(A),
         static_cast<const void *>(B), static_cast<void *>(C));
     std::fflush(stderr);
@@ -304,8 +395,11 @@ void run_group_graph(Gemm &&gemm, int resol_id, int m, const int *n,
     auto instantiateEnd = createEnd;
 
 #ifdef USE_CUTLASS
-    hipGraph_t new_graph;
-    hipGraphCreate(&new_graph, 0);
+    hipGraph_t new_graph_raw;
+    HIC_CHECK(hipGraphCreate(&new_graph_raw, 0));
+    hic_graph_owner new_graph{new_graph_raw};
+    std::vector<hic_graph_owner> child_graphs;
+    child_graphs.reserve(batchCount);
     for (int i = 0; i < batchCount; ++i) {
       if (m == 0 || n[i] == 0 || k[i] == 0)
         continue;
@@ -313,21 +407,25 @@ void run_group_graph(Gemm &&gemm, int resol_id, int m, const int *n,
       HIC_CHECK(hipStreamBeginCapture(captureStream, hipStreamCaptureModeGlobal));
       gemm(captureStream, m, n[i], k[i], alpha, A + offsetsA[i], lda, B + offsetsB[i],
            ldb[i], beta, C + offsetsC[i], ldc);
-      hipGraph_t my_graph;
-      HIC_CHECK(hipStreamEndCapture(captureStream, &my_graph));
+      hipGraph_t my_graph_raw;
+      HIC_CHECK(hipStreamEndCapture(captureStream, &my_graph_raw));
+      hic_graph_owner my_graph{my_graph_raw};
       hipGraphNode_t my_node;
       HIC_CHECK(
-          hipGraphAddChildGraphNode(&my_node, new_graph, nullptr, 0, my_graph));
+          hipGraphAddChildGraphNode(&my_node, new_graph.get(), nullptr, 0,
+                                    my_graph.get()));
+      child_graphs.push_back(std::move(my_graph));
     }
     if (debug)
-      HIC_CHECK(hipGraphGetNodes(new_graph, nullptr, &graphNodes));
+      HIC_CHECK(hipGraphGetNodes(new_graph.get(), nullptr, &graphNodes));
     const auto instantiateStart =
         debug ? graph_debug_clock::now() : graph_debug_clock::time_point{};
     hipGraphExec_t instance;
-    HIC_CHECK(hipGraphInstantiate(&instance, new_graph, NULL, NULL, 0));
+    HIC_CHECK(hipGraphInstantiate(&instance, new_graph.get(), NULL, NULL, 0));
     if (debug)
       instantiateEnd = graph_debug_clock::now();
-    HIC_CHECK(hipGraphDestroy(new_graph));
+    child_graphs.clear();
+    new_graph.reset();
 #else
     if (debug)
       beginStart = graph_debug_clock::now();
@@ -343,18 +441,20 @@ void run_group_graph(Gemm &&gemm, int resol_id, int m, const int *n,
     }
     if (debug)
       enqueueEnd = graph_debug_clock::now();
-    hipGraph_t my_graph;
-    HIC_CHECK(hipStreamEndCapture(captureStream, &my_graph));
+    hipGraph_t my_graph_raw;
+    HIC_CHECK(hipStreamEndCapture(captureStream, &my_graph_raw));
+    hic_graph_owner my_graph{my_graph_raw};
     if (debug) {
       captureEnd = graph_debug_clock::now();
-      HIC_CHECK(hipGraphGetNodes(my_graph, nullptr, &graphNodes));
+      HIC_CHECK(hipGraphGetNodes(my_graph.get(), nullptr, &graphNodes));
     }
     const auto instantiateStart =
         debug ? graph_debug_clock::now() : graph_debug_clock::time_point{};
     hipGraphExec_t instance;
-    HIC_CHECK(hipGraphInstantiate(&instance, my_graph, NULL, NULL, 0));
+    HIC_CHECK(hipGraphInstantiate(&instance, my_graph.get(), NULL, NULL, 0));
     if (debug)
       instantiateEnd = graph_debug_clock::now();
+    my_graph.reset();
 #endif
     const auto destroyStart =
         debug ? graph_debug_clock::now() : graph_debug_clock::time_point{};
@@ -367,9 +467,6 @@ void run_group_graph(Gemm &&gemm, int resol_id, int m, const int *n,
                                   HIC_CHECK(hipGraphExecDestroy(*ptr));
                                   delete ptr;
                                 })});
-    ptrCache.insert({key, std::make_tuple(A, B, C)});
-    if (debug)
-      signatureCache.insert_or_assign(key, signature);
     if (debug) {
       std::fprintf(
           stderr,
@@ -379,8 +476,8 @@ void run_group_graph(Gemm &&gemm, int resol_id, int m, const int *n,
           "end_capture_ms=%.3f instantiate_ms=%.3f stream_destroy_ms=%.3f "
           "build_total_ms=%.3f\n",
           graph_debug_rank(), static_cast<long>(getpid()), sequence,
-          std::is_same<Real, double>::value ? "f64" : "f32", resol_id, m,
-          blas_id, batchCount, activeGroups, graphNodes,
+          std::is_same<Real, double>::value ? "f64" : "f32", key.resol_id, m,
+          key.blas_id, batchCount, activeGroups, graphNodes,
           graph_debug_ms(createStart, createEnd),
           graph_debug_ms(beginStart, beginEnd),
           graph_debug_ms(beginEnd, enqueueEnd),
@@ -408,8 +505,8 @@ void run_group_graph(Gemm &&gemm, int resol_id, int m, const int *n,
                  "seq=%" PRIu64 " precision=%s resol=%d m=%d blas=%d "
                  "cache=%s launch_ms=%.3f sync_ms=%.3f host_total_ms=%.3f\n",
                  graph_debug_rank(), static_cast<long>(getpid()), sequence,
-                 std::is_same<Real, double>::value ? "f64" : "f32", resol_id,
-                 m, blas_id, cacheMiss ? "miss" : "hit",
+                 std::is_same<Real, double>::value ? "f64" : "f32",
+                 key.resol_id, m, key.blas_id, cacheMiss ? "miss" : "hit",
                  graph_debug_ms(launchStart, launchEnd),
                  graph_debug_ms(launchEnd, syncEnd),
                  graph_debug_ms(callStart, syncEnd));
@@ -525,11 +622,16 @@ void hipblas_sgemm_wrapper_grouped(
     run_group(hipblas_gemm_grouped<float>(op_t1, op_t2), resol_id, m, n, k,
               alpha, A, lda, offsetsA, B, ldb, offsetsB, beta, C, ldc,
               offsetsC, batchCount, stream, blas_id, synchronize);
-  else
-    run_group_graph(hipblas_gemm_grouped<float>(op_t1, op_t2), resol_id, m, n,
-                    k, alpha, A, lda, offsetsA, B, ldb, offsetsB, beta, C, ldc,
-                    offsetsC, batchCount, stream, blas_id, growing_allocator,
+  else {
+    const auto key = make_cache_key(
+        resol_id, blas_id, static_cast<int>(op_t1), static_cast<int>(op_t2), m,
+        n, k, alpha, A, lda, offsetsA, B, ldb, offsetsB, beta, C, ldc,
+        offsetsC, batchCount);
+    run_group_graph(hipblas_gemm_grouped<float>(op_t1, op_t2), key, m, n, k,
+                    alpha, A, lda, offsetsA, B, ldb, offsetsB, beta, C, ldc,
+                    offsetsC, batchCount, stream, growing_allocator,
                     synchronize);
+  }
 #else
   run_group(hipblas_gemm_grouped<float>(op_t1, op_t2), resol_id, m, n, k, alpha,
             A, lda, offsetsA, B, ldb, offsetsB, beta, C, ldc, offsetsC,
@@ -557,7 +659,10 @@ void hipblas_dgemm_wrapper_grouped(int resol_id, int blas_id, char transa,
     op_t2 = HIPBLAS_OP_T;
 
 #ifdef USE_GRAPHS_GEMM
-  const auto key = cache_key{resol_id, m, blas_id};
+  const auto key = make_cache_key(
+      resol_id, blas_id, static_cast<int>(op_t1), static_cast<int>(op_t2), m, n,
+      k, alpha, A, lda, offsetsA, B, ldb, offsetsB, beta, C, ldc, offsetsC,
+      batchCount);
   const bool forceGroup = graph_debug_force_group();
   const bool firstCall =
       !forceGroup && get_graph_warmup_cache<hipblas_gemm_grouped<double>>()
@@ -573,9 +678,9 @@ void hipblas_dgemm_wrapper_grouped(int resol_id, int blas_id, char transa,
               alpha, A, lda, offsetsA, B, ldb, offsetsB, beta, C, ldc,
               offsetsC, batchCount, stream, blas_id, synchronize);
   else
-    run_group_graph(hipblas_gemm_grouped<double>(op_t1, op_t2), resol_id, m, n,
-                    k, alpha, A, lda, offsetsA, B, ldb, offsetsB, beta, C, ldc,
-                    offsetsC, batchCount, stream, blas_id, growing_allocator,
+    run_group_graph(hipblas_gemm_grouped<double>(op_t1, op_t2), key, m, n, k,
+                    alpha, A, lda, offsetsA, B, ldb, offsetsB, beta, C, ldc,
+                    offsetsC, batchCount, stream, growing_allocator,
                     synchronize);
 #else
   run_group(hipblas_gemm_grouped<double>(op_t1, op_t2), resol_id, m, n, k,

@@ -4,6 +4,7 @@
 #include <memory>
 
 #include "growing_allocator.h"
+#include "hicgraph.h"
 
 #define fftSafeCall(err) __fftSafeCall(err, __FILE__, __LINE__)
 
@@ -206,27 +207,36 @@ void run_group_graph(typename Type::real *data_real,
     for (auto &plan : plans) {
       plan.exec(data_real, data_complex);
     }
-    hipGraph_t my_graph;
-    HIC_CHECK(hipStreamEndCapture(stream, &my_graph));
+    hipGraph_t my_graph_raw;
+    HIC_CHECK(hipStreamEndCapture(stream, &my_graph_raw));
+    hic_graph_owner my_graph{my_graph_raw};
     hipGraphExec_t instance;
-    HIC_CHECK(hipGraphInstantiate(&instance, my_graph, NULL, NULL, 0));
+    HIC_CHECK(hipGraphInstantiate(&instance, my_graph.get(), NULL, NULL, 0));
+    my_graph.reset();
 #endif
 #if CUDAGPU
     // now create the graph
-    hipGraph_t new_graph;
-    hipGraphCreate(&new_graph, 0);
+    hipGraph_t new_graph_raw;
+    HIC_CHECK(hipGraphCreate(&new_graph_raw, 0));
+    hic_graph_owner new_graph{new_graph_raw};
+    std::vector<hic_graph_owner> child_graphs;
+    child_graphs.reserve(plans.size());
     for (auto &plan : plans) {
       HIC_CHECK(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal));
       plan.exec(data_real, data_complex);
-      hipGraph_t my_graph;
-      HIC_CHECK(hipStreamEndCapture(stream, &my_graph));
+      hipGraph_t my_graph_raw;
+      HIC_CHECK(hipStreamEndCapture(stream, &my_graph_raw));
+      hic_graph_owner my_graph{my_graph_raw};
       hipGraphNode_t my_node;
       HIC_CHECK(
-          hipGraphAddChildGraphNode(&my_node, new_graph, nullptr, 0, my_graph));
+          hipGraphAddChildGraphNode(&my_node, new_graph.get(), nullptr, 0,
+                                    my_graph.get()));
+      child_graphs.push_back(std::move(my_graph));
     }
     hipGraphExec_t instance;
-    HIC_CHECK(hipGraphInstantiate(&instance, new_graph, NULL, NULL, 0));
-    HIC_CHECK(hipGraphDestroy(new_graph));
+    HIC_CHECK(hipGraphInstantiate(&instance, new_graph.get(), NULL, NULL, 0));
+    child_graphs.clear();
+    new_graph.reset();
 #endif
     HIC_CHECK(hipStreamDestroy(stream));
 

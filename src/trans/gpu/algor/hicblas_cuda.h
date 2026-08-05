@@ -71,6 +71,7 @@
 #define hipDeviceSynchronize cudaDeviceSynchronize
 #define hipStreamSynchronize cudaStreamSynchronize
 #define hipMemGetInfo cudaMemGetInfo
+#define hipGetDevice cudaGetDevice
 
 inline static const char * _blasGetErrorEnum(cublasStatus_t error)
 {
