@@ -14,6 +14,7 @@
 #include <atomic>
 #include <chrono>
 #include <cinttypes>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -312,7 +313,7 @@ template <typename Gemm> graph_cache_state<Gemm> &get_graph_cache_state() {
   return state;
 }
 
-template <typename Gemm> void free_gemm_graph_cache(float *, size_t) {
+template <typename Gemm> void free_gemm_graph_cache(void *, size_t) {
   auto &state = get_graph_cache_state<Gemm>();
   std::lock_guard<std::mutex> lock(state.mutex);
   if (graph_debug_enabled()) {
@@ -762,6 +763,10 @@ void hipblas_dgemm_wrapper_grouped(int resol_id, int blas_id, char transa,
 #endif
 }
 
+hipStream_t hip_stream_from_value(std::intptr_t stream) {
+  return reinterpret_cast<hipStream_t>(stream);
+}
+
 } // namespace
 
 extern "C" {
@@ -769,7 +774,7 @@ void hipblas_dgemm_wrapper(char transa, char transb, int m, int n, int k,
                            double alpha, const double *A, int lda, int tda,
                            const double *B, int ldb, int tdb, double beta,
                            double *C, int ldc, int tdc, int batchCount,
-                           size_t stream, void *growing_allocator) {
+                           std::intptr_t stream, void *growing_allocator) {
 
   hipblasOperation_t op_t1 = HIPBLAS_OP_N, op_t2 = HIPBLAS_OP_N;
 
@@ -779,7 +784,7 @@ void hipblas_dgemm_wrapper(char transa, char transb, int m, int n, int k,
     op_t2 = HIPBLAS_OP_T;
 
   hipblasHandle_t handle = get_hipblas_handle();
-  HICBLAS_CHECK(hipblasSetStream(handle, *(hipStream_t *)stream));
+  HICBLAS_CHECK(hipblasSetStream(handle, hip_stream_from_value(stream)));
 
   HICBLAS_CHECK(hipblasDgemmStridedBatched(
       handle, op_t1, op_t2, m, n, k, &alpha, (const double *)A, lda, tda,
@@ -790,7 +795,7 @@ void hipblas_sgemm_wrapper(char transa, char transb, int m, int n, int k,
                            float alpha, const float *A, int lda, int tda,
                            const float *B, int ldb, int tdb, float beta,
                            float *C, int ldc, int tdc, int batchCount,
-                           void *growing_allocator) {
+                           std::intptr_t stream, void *growing_allocator) {
 
   hipblasOperation_t op_t1 = HIPBLAS_OP_N, op_t2 = HIPBLAS_OP_N;
 
@@ -800,7 +805,7 @@ void hipblas_sgemm_wrapper(char transa, char transb, int m, int n, int k,
     op_t2 = HIPBLAS_OP_T;
 
   hipblasHandle_t handle = get_hipblas_handle();
-  HICBLAS_CHECK(hipblasSetStream(handle, nullptr));
+  HICBLAS_CHECK(hipblasSetStream(handle, hip_stream_from_value(stream)));
   HICBLAS_CHECK(hipblasSgemmStridedBatched(
       handle, op_t1, op_t2, m, n, k, &alpha, (const float *)A, lda, tda,
       (const float *)B, ldb, tdb, &beta, (float *)C, ldc, tdc, batchCount));
@@ -810,18 +815,19 @@ void hipblas_sgemm_wrapper_grouped(
     int resol_id, int blas_id, char transa, char transb, int m, const int *n,
     const int *k, float alpha, const float *A, int lda, const int64_t *offsetsA,
     const float *B, const int *ldb, const int64_t *offsetsB, float beta,
-    float *C, int ldc, const int64_t *offsetsC, int batchCount, size_t stream,
+    float *C, int ldc, const int64_t *offsetsC, int batchCount,
+    std::intptr_t stream,
     void *growing_allocator) {
 #ifdef USE_CUTLASS
   cutlass_sgemm_wrapper_grouped(resol_id, blas_id, transa, transb, m, n, k,
                                 alpha, A, lda, offsetsA, B, ldb, offsetsB, beta,
                                 C, ldc, offsetsC, batchCount,
-                                *(hipStream_t *)stream, growing_allocator);
+                                hip_stream_from_value(stream), growing_allocator);
 #else
   hipblas_sgemm_wrapper_grouped(resol_id, blas_id, transa, transb, m, n, k,
                                 alpha, A, lda, offsetsA, B, ldb, offsetsB, beta,
                                 C, ldc, offsetsC, batchCount,
-                                *(hipStream_t *)stream, growing_allocator);
+                                hip_stream_from_value(stream), growing_allocator);
 #endif
 }
 
@@ -829,18 +835,19 @@ void hipblas_sgemm_wrapper_grouped_async(
     int resol_id, int blas_id, char transa, char transb, int m, const int *n,
     const int *k, float alpha, const float *A, int lda, const int64_t *offsetsA,
     const float *B, const int *ldb, const int64_t *offsetsB, float beta,
-    float *C, int ldc, const int64_t *offsetsC, int batchCount, size_t stream,
+    float *C, int ldc, const int64_t *offsetsC, int batchCount,
+    std::intptr_t stream,
     void *growing_allocator) {
 #ifdef USE_CUTLASS
   cutlass_sgemm_wrapper_grouped(resol_id, blas_id, transa, transb, m, n, k,
                                 alpha, A, lda, offsetsA, B, ldb, offsetsB, beta,
                                 C, ldc, offsetsC, batchCount,
-                                *(hipStream_t *)stream, growing_allocator);
+                                hip_stream_from_value(stream), growing_allocator);
 #else
   hipblas_sgemm_wrapper_grouped(resol_id, blas_id, transa, transb, m, n, k,
                                 alpha, A, lda, offsetsA, B, ldb, offsetsB, beta,
                                 C, ldc, offsetsC, batchCount,
-                                *(hipStream_t *)stream, growing_allocator,
+                                hip_stream_from_value(stream), growing_allocator,
                                 false);
 #endif
 }
@@ -852,12 +859,12 @@ void hipblas_dgemm_wrapper_grouped(int resol_id, int blas_id, char transa,
                                    const double *B, const int *ldb,
                                    const int64_t *offsetsB, double beta,
                                    double *C, int ldc, const int64_t *offsetsC,
-                                   int batchCount, size_t stream,
+                                   int batchCount, std::intptr_t stream,
                                    void *growing_allocator) {
   hipblas_dgemm_wrapper_grouped(resol_id, blas_id, transa, transb, m, n, k,
                                 alpha, A, lda, offsetsA, B, ldb, offsetsB, beta,
                                 C, ldc, offsetsC, batchCount,
-                                *(hipStream_t *)stream, growing_allocator);
+                                hip_stream_from_value(stream), growing_allocator);
 }
 
 void hipblas_dgemm_wrapper_grouped_async(
@@ -865,12 +872,12 @@ void hipblas_dgemm_wrapper_grouped_async(
     const int *k, double alpha, const double *A, int lda,
     const int64_t *offsetsA, const double *B, const int *ldb,
     const int64_t *offsetsB, double beta, double *C, int ldc,
-    const int64_t *offsetsC, int batchCount, size_t stream,
+    const int64_t *offsetsC, int batchCount, std::intptr_t stream,
     void *growing_allocator) {
   hipblas_dgemm_wrapper_grouped(resol_id, blas_id, transa, transb, m, n, k,
                                 alpha, A, lda, offsetsA, B, ldb, offsetsB, beta,
                                 C, ldc, offsetsC, batchCount,
-                                *(hipStream_t *)stream, growing_allocator,
+                                hip_stream_from_value(stream), growing_allocator,
                                 graph_debug_force_sync_async());
 }
 
