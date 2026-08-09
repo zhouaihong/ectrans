@@ -665,6 +665,181 @@ private:
   hipblasOperation_t transa_, transb_;
 };
 
+int dgemm_graph_lane_limit() {
+  static const int lanes = [] {
+    const char *value = std::getenv("ECTRANS_GEMM_GRAPH_LANES");
+    if (value == nullptr || value[0] == '\0')
+      return 8;
+    return std::max(1, std::min(32, std::atoi(value)));
+  }();
+  return lanes;
+}
+
+void submit_hipblas_dgemm(hipblasHandle_t handle, hipblasOperation_t transa,
+                          hipblasOperation_t transb, hipStream_t stream, int m,
+                          int n, int k, double alpha, const double *A, int lda,
+                          const double *B, int ldb, double beta, double *C,
+                          int ldc) {
+  HICBLAS_CHECK(hipblasSetStream(handle, stream));
+  HICBLAS_CHECK(hipblasDgemm(handle, transa, transb, m, n, k, &alpha, A, lda,
+                             B, ldb, &beta, C, ldc));
+}
+
+void run_dgemm_graph_dag(
+    hipblasOperation_t transa, hipblasOperation_t transb,
+    const cache_key<double> &key, int m, const int *n, const int *k,
+    double alpha, const double *A, int lda, const int64_t *offsetsA,
+    const double *B, const int *ldb, const int64_t *offsetsB, double beta,
+    double *C, int ldc, const int64_t *offsetsC, int batchCount,
+    hipStream_t stream, void *growing_allocator, bool synchronize) {
+  using gemm_type = hipblas_gemm_grouped<double>;
+  const bool debug = graph_debug_enabled();
+  const auto callStart =
+      debug ? graph_debug_clock::now() : graph_debug_clock::time_point{};
+  const uint64_t sequence = debug ? ++graph_debug_sequence : 0;
+
+  std::vector<int> active;
+  active.reserve(batchCount);
+  for (int i = 0; i < batchCount; ++i)
+    if (m != 0 && n[i] != 0 && k[i] != 0)
+      active.push_back(i);
+  const int lanes = std::min(dgemm_graph_lane_limit(),
+                             static_cast<int>(active.size()));
+  if (lanes <= 1) {
+    run_group_graph(gemm_type(transa, transb), key, m, n, k, alpha, A, lda,
+                    offsetsA, B, ldb, offsetsB, beta, C, ldc, offsetsC,
+                    batchCount, stream, growing_allocator, synchronize);
+    return;
+  }
+
+  {
+    std::lock_guard<std::mutex> registration_lock(
+        growing_allocator_registration_mutex);
+    growing_allocator_register_free_c(growing_allocator,
+                                      free_gemm_graph_cache<gemm_type>);
+  }
+
+  auto &cacheState = get_graph_cache_state<gemm_type>();
+  std::unique_lock<std::mutex> cacheLock(cacheState.mutex);
+  auto &graphCache = cacheState.graph_cache;
+  auto graph = graphCache.find(key);
+  const bool cacheMiss = graph == graphCache.end();
+  std::shared_ptr<graph_exec_entry> graphExec;
+  if (!cacheMiss)
+    graphExec = graph->second;
+
+  if (cacheMiss) {
+    const auto buildStart =
+        debug ? graph_debug_clock::now() : graph_debug_clock::time_point{};
+    std::stable_sort(active.begin(), active.end(), [&](int left, int right) {
+      return static_cast<uint64_t>(n[left]) * k[left] >
+             static_cast<uint64_t>(n[right]) * k[right];
+    });
+    std::vector<std::vector<int>> laneGroups(lanes);
+    std::vector<uint64_t> laneWork(lanes, 0);
+    for (int groupIndex : active) {
+      const int lane = static_cast<int>(
+          std::min_element(laneWork.begin(), laneWork.end()) -
+          laneWork.begin());
+      laneGroups[lane].push_back(groupIndex);
+      laneWork[lane] += static_cast<uint64_t>(n[groupIndex]) * k[groupIndex];
+    }
+
+    int device;
+    HIC_CHECK(hipGetDevice(&device));
+    hipGraph_t parentRaw;
+    HIC_CHECK(hipGraphCreate(&parentRaw, 0));
+    hic_graph_owner parent{parentRaw};
+    std::vector<hic_graph_owner> childGraphs;
+    childGraphs.reserve(lanes);
+    std::vector<hipStream_t> laneStreams(lanes);
+    std::vector<std::unique_ptr<hipblas_handle_owner>> laneHandles;
+    laneHandles.reserve(lanes);
+
+    // Lane-handle warmup must not pass work already queued on the caller's
+    // OpenACC stream. This synchronization only occurs while building a graph.
+    HIC_CHECK(hipStreamSynchronize(stream));
+    for (int lane = 0; lane < lanes; ++lane) {
+      HIC_CHECK(hipStreamCreate(&laneStreams[lane]));
+      laneHandles.emplace_back(std::make_unique<hipblas_handle_owner>(device));
+      const int warmupIndex = laneGroups[lane].front();
+      submit_hipblas_dgemm(
+          laneHandles[lane]->get(), transa, transb, laneStreams[lane], m,
+          n[warmupIndex], k[warmupIndex], alpha, A + offsetsA[warmupIndex], lda,
+          B + offsetsB[warmupIndex], ldb[warmupIndex], beta,
+          C + offsetsC[warmupIndex], ldc);
+      HIC_CHECK(hipStreamSynchronize(laneStreams[lane]));
+
+      HIC_CHECK(hipStreamBeginCapture(laneStreams[lane],
+                                      hipStreamCaptureModeGlobal));
+      for (int groupIndex : laneGroups[lane])
+        submit_hipblas_dgemm(
+            laneHandles[lane]->get(), transa, transb, laneStreams[lane], m,
+            n[groupIndex], k[groupIndex], alpha, A + offsetsA[groupIndex], lda,
+            B + offsetsB[groupIndex], ldb[groupIndex], beta,
+            C + offsetsC[groupIndex], ldc);
+      hipGraph_t childRaw;
+      HIC_CHECK(hipStreamEndCapture(laneStreams[lane], &childRaw));
+      hic_graph_owner child{childRaw};
+      hipGraphNode_t childNode;
+      HIC_CHECK(hipGraphAddChildGraphNode(&childNode, parent.get(), nullptr, 0,
+                                         child.get()));
+      childGraphs.push_back(std::move(child));
+    }
+
+    hipGraphExec_t instance;
+    HIC_CHECK(hipGraphInstantiate(&instance, parent.get(), nullptr, nullptr, 0));
+    laneHandles.clear();
+    for (hipStream_t laneStream : laneStreams)
+      HIC_CHECK(hipStreamDestroy(laneStream));
+    childGraphs.clear();
+    parent.reset();
+
+    graphExec = std::make_shared<graph_exec_entry>(instance);
+    graphCache.emplace(key, graphExec);
+    if (debug) {
+      const auto buildEnd = graph_debug_clock::now();
+      const auto [minimum, maximum] =
+          std::minmax_element(laneWork.begin(), laneWork.end());
+      std::fprintf(
+          stderr,
+          "EC_GRAPH_DEBUG event=build mode=dag rank=%s pid=%ld seq=%" PRIu64
+          " precision=f64 resol=%d m=%d blas=%d batch=%d active=%zu lanes=%d "
+          "lane_work_min=%" PRIu64 " lane_work_max=%" PRIu64
+          " build_total_ms=%.3f\n",
+          graph_debug_rank(), static_cast<long>(getpid()), sequence,
+          key.resol_id, m, key.blas_id, batchCount, active.size(), lanes,
+          *minimum, *maximum, graph_debug_ms(buildStart, buildEnd));
+      std::fflush(stderr);
+    }
+  }
+  cacheLock.unlock();
+
+  const auto launchStart =
+      debug ? graph_debug_clock::now() : graph_debug_clock::time_point{};
+  graphExec->launch(stream);
+  const auto launchEnd =
+      debug ? graph_debug_clock::now() : graph_debug_clock::time_point{};
+  auto syncEnd = launchEnd;
+  if (synchronize)
+    HIC_CHECK(hipStreamSynchronize(stream));
+  if (debug)
+    syncEnd = graph_debug_clock::now();
+  if (debug) {
+    std::fprintf(stderr,
+                 "EC_GRAPH_DEBUG event=return mode=dag rank=%s pid=%ld "
+                 "seq=%" PRIu64 " precision=f64 resol=%d m=%d blas=%d "
+                 "cache=%s lanes=%d launch_ms=%.3f sync_ms=%.3f "
+                 "host_total_ms=%.3f\n",
+                 graph_debug_rank(), static_cast<long>(getpid()), sequence,
+                 key.resol_id, m, key.blas_id, cacheMiss ? "miss" : "hit",
+                 lanes, graph_debug_ms(launchStart, launchEnd),
+                 graph_debug_ms(launchEnd, syncEnd),
+                 graph_debug_ms(callStart, syncEnd));
+    std::fflush(stderr);
+  }
+}
+
 #ifndef USE_CUTLASS
 
 void hipblas_sgemm_wrapper_grouped(
@@ -750,10 +925,9 @@ void hipblas_dgemm_wrapper_grouped(int resol_id, int blas_id, char transa,
                 offsetsC, batchCount, stream, blas_id, synchronize);
     } else {
       cacheLock.unlock();
-      run_group_graph(hipblas_gemm_grouped<double>(op_t1, op_t2), key, m, n,
-                      k, alpha, A, lda, offsetsA, B, ldb, offsetsB, beta, C,
-                      ldc, offsetsC, batchCount, stream, growing_allocator,
-                      synchronize);
+      run_dgemm_graph_dag(op_t1, op_t2, key, m, n, k, alpha, A, lda, offsetsA,
+                          B, ldb, offsetsB, beta, C, ldc, offsetsC, batchCount,
+                          stream, growing_allocator, synchronize);
     }
   }
 #else
