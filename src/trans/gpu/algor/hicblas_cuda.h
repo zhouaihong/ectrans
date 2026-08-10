@@ -27,6 +27,7 @@
 
 // Data types
 #define hipError_t cudaError_t
+#define hipEvent_t cudaEvent_t
 #define hipStream_t cudaStream_t
 #define hipblasHandle_t cublasHandle_t
 #define hipblasStatus_t cublasStatus_t
@@ -38,6 +39,7 @@
 // Constants
 #define hipMemcpyHostToDevice cudaMemcpyHostToDevice
 #define hipMemcpyDeviceToHost cudaMemcpyDeviceToHost
+#define hipEventDisableTiming cudaEventDisableTiming
 
 // Library calls
 #define hipblasCreate cublasCreate
@@ -57,8 +59,12 @@
 #define hipGraphInstantiate cudaGraphInstantiate
 #define hipGraphAddChildGraphNode cudaGraphAddChildGraphNode
 #define hipGraphGetNodes cudaGraphGetNodes
+#define hipEventCreateWithFlags cudaEventCreateWithFlags
+#define hipEventDestroy cudaEventDestroy
+#define hipEventRecord cudaEventRecord
 #define hipStreamCreate cudaStreamCreate
 #define hipStreamDestroy cudaStreamDestroy
+#define hipStreamWaitEvent cudaStreamWaitEvent
 #define hipStreamCaptureModeGlobal cudaStreamCaptureModeGlobal
 #define hipStreamBeginCapture cudaStreamBeginCapture
 #define hipStreamEndCapture cudaStreamEndCapture

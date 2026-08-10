@@ -747,11 +747,6 @@ void run_dgemm_graph_dag(
 
     int device;
     HIC_CHECK(hipGetDevice(&device));
-    hipGraph_t parentRaw;
-    HIC_CHECK(hipGraphCreate(&parentRaw, 0));
-    hic_graph_owner parent{parentRaw};
-    std::vector<hic_graph_owner> childGraphs;
-    childGraphs.reserve(lanes);
     std::vector<hipStream_t> laneStreams(lanes);
     std::vector<std::unique_ptr<hipblas_handle_owner>> laneHandles;
     laneHandles.reserve(lanes);
@@ -769,31 +764,50 @@ void run_dgemm_graph_dag(
           B + offsetsB[warmupIndex], ldb[warmupIndex], beta,
           C + offsetsC[warmupIndex], ldc);
       HIC_CHECK(hipStreamSynchronize(laneStreams[lane]));
+    }
 
-      HIC_CHECK(hipStreamBeginCapture(laneStreams[lane],
-                                      hipStreamCaptureModeGlobal));
+    hipEvent_t forkEvent;
+    HIC_CHECK(hipEventCreateWithFlags(&forkEvent, hipEventDisableTiming));
+    std::vector<hipEvent_t> completionEvents(lanes - 1);
+    for (hipEvent_t &completionEvent : completionEvents)
+      HIC_CHECK(
+          hipEventCreateWithFlags(&completionEvent, hipEventDisableTiming));
+
+    HIC_CHECK(hipStreamBeginCapture(laneStreams[0],
+                                    hipStreamCaptureModeGlobal));
+    HIC_CHECK(hipEventRecord(forkEvent, laneStreams[0]));
+    for (int lane = 1; lane < lanes; ++lane)
+      HIC_CHECK(hipStreamWaitEvent(laneStreams[lane], forkEvent, 0));
+
+    for (int lane = 0; lane < lanes; ++lane) {
       for (int groupIndex : laneGroups[lane])
         submit_hipblas_dgemm(
             laneHandles[lane]->get(), transa, transb, laneStreams[lane], m,
             n[groupIndex], k[groupIndex], alpha, A + offsetsA[groupIndex], lda,
             B + offsetsB[groupIndex], ldb[groupIndex], beta,
             C + offsetsC[groupIndex], ldc);
-      hipGraph_t childRaw;
-      HIC_CHECK(hipStreamEndCapture(laneStreams[lane], &childRaw));
-      hic_graph_owner child{childRaw};
-      hipGraphNode_t childNode;
-      HIC_CHECK(hipGraphAddChildGraphNode(&childNode, parent.get(), nullptr, 0,
-                                         child.get()));
-      childGraphs.push_back(std::move(child));
+    }
+    for (int lane = 1; lane < lanes; ++lane) {
+      HIC_CHECK(
+          hipEventRecord(completionEvents[lane - 1], laneStreams[lane]));
+      HIC_CHECK(hipStreamWaitEvent(laneStreams[0],
+                                   completionEvents[lane - 1], 0));
     }
 
+    hipGraph_t graphRaw;
+    HIC_CHECK(hipStreamEndCapture(laneStreams[0], &graphRaw));
+    hic_graph_owner capturedGraph{graphRaw};
+
     hipGraphExec_t instance;
-    HIC_CHECK(hipGraphInstantiate(&instance, parent.get(), nullptr, nullptr, 0));
+    HIC_CHECK(hipGraphInstantiate(&instance, capturedGraph.get(), nullptr,
+                                  nullptr, 0));
     laneHandles.clear();
+    HIC_CHECK(hipEventDestroy(forkEvent));
+    for (hipEvent_t completionEvent : completionEvents)
+      HIC_CHECK(hipEventDestroy(completionEvent));
     for (hipStream_t laneStream : laneStreams)
       HIC_CHECK(hipStreamDestroy(laneStream));
-    childGraphs.clear();
-    parent.reset();
+    capturedGraph.reset();
 
     graphExec = std::make_shared<graph_exec_entry>(instance);
     graphCache.emplace(key, graphExec);
