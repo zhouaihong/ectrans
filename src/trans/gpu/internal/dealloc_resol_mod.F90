@@ -56,6 +56,9 @@ USE TPM_FLT,         ONLY: S, FLT_TYPE_WRAP
 USE TPM_CTL,         ONLY: C
 USE SEEFMM_MIX,      ONLY: FREE_SEEFMM
 USE SET_RESOL_MOD,   ONLY: SET_RESOL
+#ifndef TRANS_SINGLE
+USE BUTTERFLY_GPU_DP_MOD, ONLY: FREE_GPU_BUTTERFLY_PLANS
+#endif
 !
 
 IMPLICIT NONE
@@ -91,6 +94,10 @@ ELSE
 !$ACC WAIT(1)
 #endif
 #ifdef OMPGPU
+#endif
+
+#ifndef TRANS_SINGLE
+  CALL FREE_GPU_BUTTERFLY_PLANS
 #endif
 
   ! TPM_FLD is more complex because it has pointers

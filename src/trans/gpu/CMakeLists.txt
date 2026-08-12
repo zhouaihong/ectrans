@@ -96,6 +96,13 @@ function(generate_backend_sources)
   list( APPEND files
           algor/seefmm_mix.F90
   )
+  if( backend STREQUAL "gpu_dp" )
+    list( APPEND files algor/butterfly_alg_mod.F90 )
+  else()
+    ecbuild_list_exclude_pattern( LIST files REGEX
+            internal/butterfly_gpu_mod.F90
+    )
+  endif()
   ecbuild_list_exclude_pattern( LIST files REGEX
           parkind_ectrans.F90
           tpm_stats.F90
