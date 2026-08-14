@@ -30,6 +30,8 @@
 #include "hicgraph.h"
 #ifdef USE_CUTLASS
 #include "cutlass/gemm/device/gemm.h"
+#include "cutlass/gemm/device/gemm_grouped.h"
+#include "cutlass/gemm/kernel/default_gemm_grouped.h"
 #endif
 
 #include "growing_allocator.h"
@@ -62,6 +64,34 @@ bool graph_debug_force_sync_async() {
     return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
   }();
   return enabled;
+}
+
+bool cutlass_grouped_dp_enabled() {
+  static const bool enabled = [] {
+    const char *value = std::getenv("ECTRANS_GPU_CUTLASS_GROUPED_DP");
+    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+  }();
+  return enabled;
+}
+
+bool cutlass_grouped_dp_profitable(int m, const int *n, const int *k,
+                                   int batchCount) {
+  int active = 0;
+  int first_n = 0;
+  int first_k = 0;
+  bool heterogeneous = false;
+  for (int i = 0; i < batchCount; ++i) {
+    if (m == 0 || n[i] == 0 || k[i] == 0)
+      continue;
+    if (active == 0) {
+      first_n = n[i];
+      first_k = k[i];
+    } else if (n[i] != first_n || k[i] != first_k) {
+      heterogeneous = true;
+    }
+    ++active;
+  }
+  return active >= 8 && heterogeneous;
 }
 
 const char *graph_debug_rank() {
@@ -910,6 +940,17 @@ void hipblas_dgemm_wrapper_grouped(int resol_id, int blas_id, char transa,
   if (transb == 'T' || transb == 't')
     op_t2 = HIPBLAS_OP_T;
 
+#ifdef USE_CUTLASS
+  if (cutlass_grouped_dp_enabled() &&
+      cutlass_grouped_dp_profitable(m, n, k, batchCount)) {
+    cutlass_dgemm_wrapper_grouped_true(
+        resol_id, blas_id, op_t1, op_t2, m, n, k, alpha, A, lda, offsetsA, B,
+        ldb, offsetsB, beta, C, ldc, offsetsC, batchCount, stream,
+        growing_allocator, synchronize);
+    return;
+  }
+#endif
+
 #ifdef USE_GRAPHS_GEMM
   const auto key = make_cache_key(
       resol_id, blas_id, static_cast<int>(op_t1), static_cast<int>(op_t2), m, n,
@@ -1106,6 +1147,14 @@ void clean_gemm(int resol_id) {
       detail::CutlassType::cutlass_fp32, CUBLAS_OP_T, CUBLAS_OP_N>>(resol_id);
   erase_from_caches<detail::cutlass_sgemm_grouped<
       detail::CutlassType::cutlass_fp32, CUBLAS_OP_N, CUBLAS_OP_N>>(resol_id);
+  erase_cutlass_dgemm_grouped_cache<
+      detail::cutlass_dgemm_grouped_entry<CUBLAS_OP_T, CUBLAS_OP_T>>(resol_id);
+  erase_cutlass_dgemm_grouped_cache<
+      detail::cutlass_dgemm_grouped_entry<CUBLAS_OP_N, CUBLAS_OP_T>>(resol_id);
+  erase_cutlass_dgemm_grouped_cache<
+      detail::cutlass_dgemm_grouped_entry<CUBLAS_OP_T, CUBLAS_OP_N>>(resol_id);
+  erase_cutlass_dgemm_grouped_cache<
+      detail::cutlass_dgemm_grouped_entry<CUBLAS_OP_N, CUBLAS_OP_N>>(resol_id);
 #endif
 }
 }
