@@ -1069,6 +1069,23 @@ void hipblas_dgemm_wrapper_grouped_async(
                                 graph_debug_force_sync_async());
 }
 
+void hipblas_dgemm_wrapper_grouped_ordered_async(
+    int resol_id, int blas_id, char transa, char transb, int m, const int *n,
+    const int *k, double alpha, const double *A, int lda,
+    const int64_t *offsetsA, const double *B, const int *ldb,
+    const int64_t *offsetsB, double beta, double *C, int ldc,
+    const int64_t *offsetsC, int batchCount, std::intptr_t stream,
+    void *growing_allocator) {
+  hipblasOperation_t op_t1 = HIPBLAS_OP_N, op_t2 = HIPBLAS_OP_N;
+  if (transa == 'T' || transa == 't')
+    op_t1 = HIPBLAS_OP_T;
+  if (transb == 'T' || transb == 't')
+    op_t2 = HIPBLAS_OP_T;
+  run_group(hipblas_gemm_grouped<double>(op_t1, op_t2), resol_id, m, n, k,
+            alpha, A, lda, offsetsA, B, ldb, offsetsB, beta, C, ldc, offsetsC,
+            batchCount, hip_stream_from_value(stream), blas_id, false);
+}
+
 void clean_gemm(int resol_id) {
   erase_from_caches<hipblas_gemm_grouped<float>>(resol_id);
   erase_from_caches<hipblas_gemm_grouped<double>>(resol_id);
