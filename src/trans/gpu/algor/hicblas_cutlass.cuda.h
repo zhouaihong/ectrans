@@ -495,9 +495,30 @@ public:
   cutlass_dgemm_grouped_ordered_entry(
       int m, const int *n, const int *k, double alpha, const double *A,
       int lda, const int64_t *offsetsA, const double *B, const int *ldb,
-      const int64_t *offsetsB, double *C, int ldc,
+      const int64_t *offsetsB, double beta, double *C, int ldc,
       const int64_t *offsetsC, int batchCount, hipStream_t stream)
       : m_(m), output_(C) {
+    const char *layered_value =
+        std::getenv("ECTRANS_GPU_CUTLASS_ORDERED_LAYERED");
+    layered_ = layered_value != nullptr && layered_value[0] != '\0' &&
+               std::strcmp(layered_value, "0") != 0 && m == ldc;
+    if (layered_) {
+      for (int group = 0; group < batchCount; ++group) {
+        if (m == 0 || n[group] == 0 || k[group] == 0)
+          continue;
+        if (offsetsC[group] % ldc != 0) {
+          layered_ = false;
+          break;
+        }
+      }
+    }
+
+    if (layered_) {
+      construct_layers(m, n, k, alpha, A, lda, offsetsA, B, ldb, offsetsB,
+                       beta, C, ldc, offsetsC, batchCount, stream);
+      return;
+    }
+
     std::vector<int64_t> scratch_offsets(batchCount, 0);
     std::map<int64_t, std::vector<int64_t>> contributions;
     int64_t partial_elements = 0;
@@ -542,13 +563,25 @@ public:
           pool_->data(), m, scratch_offsets.data(), batchCount, stream);
     }
     partial_elements_ = partial_elements;
+    problem_count_ = gemm_->problem_count();
+    threadblock_count_ = gemm_->threadblock_count();
   }
 
-  int problem_count() const { return gemm_->problem_count(); }
-  int threadblock_count() const { return gemm_->threadblock_count(); }
+  int problem_count() const { return problem_count_; }
+  int threadblock_count() const { return threadblock_count_; }
   int64_t partial_elements() const { return partial_elements_; }
+  int layer_count() const {
+    return layered_ ? static_cast<int>(layers_.size()) : 1;
+  }
+  const char *mode() const { return layered_ ? "layered" : "partial"; }
 
   void run(hipStream_t stream) {
+    if (layered_) {
+      for (auto &layer : layers_)
+        layer->run(stream);
+      return;
+    }
+
     std::lock_guard<std::mutex> lock(pool_->mutex());
     pool_->ensure_locked(partial_elements_);
     pool_->wait_locked(stream);
@@ -567,16 +600,84 @@ public:
   }
 
 private:
+  void construct_layers(
+      int m, const int *n, const int *k, double alpha, const double *A,
+      int lda, const int64_t *offsetsA, const double *B, const int *ldb,
+      const int64_t *offsetsB, double beta, double *C, int ldc,
+      const int64_t *offsetsC, int batchCount, hipStream_t stream) {
+    std::unordered_map<int64_t, int> last_layer;
+    std::vector<int> group_layers(batchCount, -1);
+    int layer_count = 0;
+
+    for (int group = 0; group < batchCount; ++group) {
+      if (m == 0 || n[group] == 0 || k[group] == 0)
+        continue;
+      const int64_t first_column = offsetsC[group] / ldc;
+      int layer = 0;
+      for (int column = 0; column < n[group]; ++column) {
+        const auto found = last_layer.find(first_column + column);
+        if (found != last_layer.end())
+          layer = std::max(layer, found->second + 1);
+      }
+      group_layers[group] = layer;
+      layer_count = std::max(layer_count, layer + 1);
+      for (int column = 0; column < n[group]; ++column)
+        last_layer[first_column + column] = layer;
+    }
+
+    std::vector<std::vector<int>> groups_by_layer(layer_count);
+    for (int group = 0; group < batchCount; ++group) {
+      if (group_layers[group] >= 0)
+        groups_by_layer[group_layers[group]].push_back(group);
+    }
+
+    layers_.reserve(layer_count);
+    for (const auto &groups : groups_by_layer) {
+      std::vector<int> layer_n;
+      std::vector<int> layer_k;
+      std::vector<int> layer_ldb;
+      std::vector<int64_t> layer_offsets_a;
+      std::vector<int64_t> layer_offsets_b;
+      std::vector<int64_t> layer_offsets_c;
+      layer_n.reserve(groups.size());
+      layer_k.reserve(groups.size());
+      layer_ldb.reserve(groups.size());
+      layer_offsets_a.reserve(groups.size());
+      layer_offsets_b.reserve(groups.size());
+      layer_offsets_c.reserve(groups.size());
+      for (int group : groups) {
+        layer_n.push_back(n[group]);
+        layer_k.push_back(k[group]);
+        layer_ldb.push_back(ldb[group]);
+        layer_offsets_a.push_back(offsetsA[group]);
+        layer_offsets_b.push_back(offsetsB[group]);
+        layer_offsets_c.push_back(offsetsC[group]);
+      }
+      auto entry = std::make_unique<grouped_entry>(
+          m, layer_n.data(), layer_k.data(), alpha, A, lda,
+          layer_offsets_a.data(), B, layer_ldb.data(), layer_offsets_b.data(),
+          beta, C, ldc, layer_offsets_c.data(),
+          static_cast<int>(groups.size()), stream);
+      problem_count_ += entry->problem_count();
+      threadblock_count_ += entry->threadblock_count();
+      layers_.push_back(std::move(entry));
+    }
+  }
+
   int m_ = 0;
   int output_columns_ = 0;
   int64_t partial_elements_ = 0;
+  int problem_count_ = 0;
+  int threadblock_count_ = 0;
   double *output_ = nullptr;
+  bool layered_ = false;
   std::shared_ptr<cutlass_dgemm_ordered_scratch_pool> pool_;
   cutlass_device_array<int64_t> target_offsets_;
   cutlass_device_array<int64_t> contribution_starts_;
   cutlass_device_array<int> contribution_counts_;
   cutlass_device_array<int64_t> partial_offsets_;
   std::unique_ptr<grouped_entry> gemm_;
+  std::vector<std::unique_ptr<grouped_entry>> layers_;
 };
 
 } // namespace detail
@@ -720,7 +821,7 @@ void cutlass_dgemm_wrapper_grouped_ordered_op(
     cache_miss = found == state.entries.end();
     if (cache_miss) {
       entry = std::make_shared<Entry>(m, n, k, alpha, A, lda, offsetsA, B,
-                                      ldb, offsetsB, C, ldc, offsetsC,
+                                      ldb, offsetsB, beta, C, ldc, offsetsC,
                                       batchCount, stream);
       state.entries.emplace(key, entry);
     } else {
@@ -732,9 +833,10 @@ void cutlass_dgemm_wrapper_grouped_ordered_op(
     std::fprintf(
         stderr,
         "EC_CUTLASS_ORDERED_DP event=run rank=%s resol=%d blas=%d "
-        "groups=%d threadblocks=%d partial_mib=%.3f cache=%s\n",
+        "groups=%d threadblocks=%d mode=%s layers=%d partial_mib=%.3f "
+        "cache=%s\n",
         graph_debug_rank(), resol_id, blas_id, entry->problem_count(),
-        entry->threadblock_count(),
+        entry->threadblock_count(), entry->mode(), entry->layer_count(),
         static_cast<double>(entry->partial_elements()) * sizeof(double) /
             (1024.0 * 1024.0),
         cache_miss ? "miss" : "hit");
