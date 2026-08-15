@@ -502,6 +502,7 @@ public:
         std::getenv("ECTRANS_GPU_CUTLASS_ORDERED_LAYERED");
     layered_ = layered_value != nullptr && layered_value[0] != '\0' &&
                std::strcmp(layered_value, "0") != 0 && m == ldc;
+    HIC_CHECK(hipGetDevice(&device_));
     if (layered_) {
       for (int group = 0; group < batchCount; ++group) {
         if (m == 0 || n[group] == 0 || k[group] == 0)
@@ -512,6 +513,11 @@ public:
         }
       }
     }
+    const char *graph_value =
+        std::getenv("ECTRANS_GPU_CUTLASS_ORDERED_GRAPH");
+    layered_graph_requested_ =
+        layered_ && graph_value != nullptr && graph_value[0] != '\0' &&
+        std::strcmp(graph_value, "0") != 0;
 
     if (layered_) {
       construct_layers(m, n, k, alpha, A, lda, offsetsA, B, ldb, offsetsB,
@@ -567,16 +573,48 @@ public:
     threadblock_count_ = gemm_->threadblock_count();
   }
 
+  ~cutlass_dgemm_grouped_ordered_entry() {
+    if (layered_graph_exec_ == nullptr)
+      return;
+    int current_device;
+    HIC_CHECK(hipGetDevice(&current_device));
+    if (current_device != device_)
+      HIC_CHECK(hipSetDevice(device_));
+    HIC_CHECK(hipGraphExecDestroy(layered_graph_exec_));
+    if (current_device != device_)
+      HIC_CHECK(hipSetDevice(current_device));
+  }
+
   int problem_count() const { return problem_count_; }
   int threadblock_count() const { return threadblock_count_; }
   int64_t partial_elements() const { return partial_elements_; }
   int layer_count() const {
     return layered_ ? static_cast<int>(layers_.size()) : 1;
   }
-  const char *mode() const { return layered_ ? "layered" : "partial"; }
+  const char *mode() const {
+    if (layered_graph_requested_)
+      return "layered_graph";
+    return layered_ ? "layered" : "partial";
+  }
 
   void run(hipStream_t stream) {
     if (layered_) {
+      std::lock_guard<std::mutex> lock(layered_graph_mutex_);
+      if (layered_graph_requested_) {
+        if (layered_graph_exec_ == nullptr) {
+          HIC_CHECK(
+              hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal));
+          for (auto &layer : layers_)
+            layer->run(stream);
+          hipGraph_t graph_raw;
+          HIC_CHECK(hipStreamEndCapture(stream, &graph_raw));
+          hic_graph_owner graph{graph_raw};
+          HIC_CHECK(hipGraphInstantiate(&layered_graph_exec_, graph.get(),
+                                        nullptr, nullptr, 0));
+        }
+        HIC_CHECK(hipGraphLaunch(layered_graph_exec_, stream));
+        return;
+      }
       for (auto &layer : layers_)
         layer->run(stream);
       return;
@@ -669,8 +707,12 @@ private:
   int64_t partial_elements_ = 0;
   int problem_count_ = 0;
   int threadblock_count_ = 0;
+  int device_ = 0;
   double *output_ = nullptr;
   bool layered_ = false;
+  bool layered_graph_requested_ = false;
+  hipGraphExec_t layered_graph_exec_ = nullptr;
+  std::mutex layered_graph_mutex_;
   std::shared_ptr<cutlass_dgemm_ordered_scratch_pool> pool_;
   cutlass_device_array<int64_t> target_offsets_;
   cutlass_device_array<int64_t> contribution_starts_;
