@@ -18,6 +18,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <type_traits>
@@ -69,6 +70,14 @@ bool graph_debug_force_sync_async() {
 bool cutlass_grouped_dp_enabled() {
   static const bool enabled = [] {
     const char *value = std::getenv("ECTRANS_GPU_CUTLASS_GROUPED_DP");
+    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+  }();
+  return enabled;
+}
+
+bool cutlass_ordered_dp_enabled() {
+  static const bool enabled = [] {
+    const char *value = std::getenv("ECTRANS_GPU_CUTLASS_ORDERED_DP");
     return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
   }();
   return enabled;
@@ -1122,6 +1131,16 @@ void hipblas_dgemm_wrapper_grouped_ordered_async(
     op_t1 = HIPBLAS_OP_T;
   if (transb == 'T' || transb == 't')
     op_t2 = HIPBLAS_OP_T;
+#ifdef USE_CUTLASS
+  if (cutlass_grouped_dp_enabled() && cutlass_ordered_dp_enabled() &&
+      beta == 1.0 && cutlass_grouped_dp_profitable(m, n, k, batchCount)) {
+    cutlass_dgemm_wrapper_grouped_ordered_true(
+        resol_id, blas_id, op_t1, op_t2, m, n, k, alpha, A, lda, offsetsA, B,
+        ldb, offsetsB, beta, C, ldc, offsetsC, batchCount,
+        hip_stream_from_value(stream), growing_allocator, false);
+    return;
+  }
+#endif
   run_group(hipblas_gemm_grouped<double>(op_t1, op_t2), resol_id, m, n, k,
             alpha, A, lda, offsetsA, B, ldb, offsetsB, beta, C, ldc, offsetsC,
             batchCount, hip_stream_from_value(stream), blas_id, false);
@@ -1155,6 +1174,18 @@ void clean_gemm(int resol_id) {
       detail::cutlass_dgemm_grouped_entry<CUBLAS_OP_T, CUBLAS_OP_N>>(resol_id);
   erase_cutlass_dgemm_grouped_cache<
       detail::cutlass_dgemm_grouped_entry<CUBLAS_OP_N, CUBLAS_OP_N>>(resol_id);
+  erase_cutlass_dgemm_grouped_cache<
+      detail::cutlass_dgemm_grouped_ordered_entry<CUBLAS_OP_T, CUBLAS_OP_T>>(
+      resol_id);
+  erase_cutlass_dgemm_grouped_cache<
+      detail::cutlass_dgemm_grouped_ordered_entry<CUBLAS_OP_N, CUBLAS_OP_T>>(
+      resol_id);
+  erase_cutlass_dgemm_grouped_cache<
+      detail::cutlass_dgemm_grouped_ordered_entry<CUBLAS_OP_T, CUBLAS_OP_N>>(
+      resol_id);
+  erase_cutlass_dgemm_grouped_cache<
+      detail::cutlass_dgemm_grouped_ordered_entry<CUBLAS_OP_N, CUBLAS_OP_N>>(
+      resol_id);
 #endif
 }
 }

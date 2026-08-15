@@ -236,6 +236,15 @@ public:
   cutlass_device_array(const cutlass_device_array &) = delete;
   cutlass_device_array &operator=(const cutlass_device_array &) = delete;
 
+  void allocate(std::size_t size) {
+    if (size == 0)
+      return;
+    HIC_CHECK(hipGetDevice(&device_));
+    HIC_CHECK(
+        hipMalloc(reinterpret_cast<void **>(&data_), size * sizeof(T)));
+    size_ = size;
+  }
+
   void assign(const std::vector<T> &values) {
     if (values.empty())
       return;
@@ -244,12 +253,22 @@ public:
                         values.size() * sizeof(T)));
     HIC_CHECK(hipMemcpy(data_, values.data(), values.size() * sizeof(T),
                         hipMemcpyHostToDevice));
+    size_ = values.size();
+  }
+
+  void update(const std::vector<T> &values, hipStream_t stream) {
+    assert(values.size() == size_);
+    if (values.empty())
+      return;
+    HIC_CHECK(cudaMemcpyAsync(data_, values.data(), values.size() * sizeof(T),
+                              cudaMemcpyHostToDevice, stream));
   }
 
   T *get() const { return data_; }
 
 private:
   T *data_ = nullptr;
+  std::size_t size_ = 0;
   int device_ = 0;
 };
 
@@ -307,6 +326,7 @@ public:
       ptr_a.push_back(const_cast<double *>(A) + offsetsA[i]);
       ptr_b.push_back(const_cast<double *>(B) + offsetsB[i]);
       ptr_c.push_back(C + offsetsC[i]);
+      output_offsets_.push_back(offsetsC[i]);
       lda_values.push_back(lda);
       ldb_values.push_back(ldb[i]);
       ldc_values.push_back(ldc);
@@ -341,6 +361,14 @@ public:
   int problem_count() const { return problem_count_; }
   int threadblock_count() const { return threadblock_count_; }
 
+  void update_output_base(double *C, hipStream_t stream) {
+    host_ptr_c_.clear();
+    host_ptr_c_.reserve(output_offsets_.size());
+    for (int64_t offset : output_offsets_)
+      host_ptr_c_.push_back(C + offset);
+    ptr_c_.update(host_ptr_c_, stream);
+  }
+
   void run(hipStream_t stream) {
     std::lock_guard<std::mutex> lock(launch_mutex_);
     CUTLASS_CHECK(gemm_.run(stream));
@@ -348,6 +376,8 @@ public:
 
 private:
   std::vector<cutlass::gemm::GemmCoord> host_problem_sizes_;
+  std::vector<int64_t> output_offsets_;
+  std::vector<double *> host_ptr_c_;
   cutlass_device_array<cutlass::gemm::GemmCoord> problem_sizes_;
   cutlass_device_array<double *> ptr_a_;
   cutlass_device_array<double *> ptr_b_;
@@ -359,6 +389,194 @@ private:
   int problem_count_ = 0;
   int threadblock_count_ = 0;
   std::mutex launch_mutex_;
+};
+
+class cutlass_dgemm_ordered_scratch_pool {
+public:
+  cutlass_dgemm_ordered_scratch_pool() {
+    HIC_CHECK(hipGetDevice(&device_));
+    HIC_CHECK(
+        hipEventCreateWithFlags(&completion_event_, hipEventDisableTiming));
+  }
+
+  ~cutlass_dgemm_ordered_scratch_pool() {
+    int current_device;
+    HIC_CHECK(hipGetDevice(&current_device));
+    if (current_device != device_)
+      HIC_CHECK(hipSetDevice(device_));
+    if (launched_)
+      HIC_CHECK(cudaEventSynchronize(completion_event_));
+    HIC_CHECK(hipEventDestroy(completion_event_));
+    if (data_ != nullptr)
+      HIC_CHECK(hipFree(data_));
+    if (current_device != device_)
+      HIC_CHECK(hipSetDevice(current_device));
+  }
+
+  void ensure_locked(int64_t elements) {
+    if (elements <= elements_)
+      return;
+    if (launched_)
+      HIC_CHECK(cudaEventSynchronize(completion_event_));
+    if (data_ != nullptr)
+      HIC_CHECK(hipFree(data_));
+    HIC_CHECK(hipMalloc(reinterpret_cast<void **>(&data_),
+                        static_cast<std::size_t>(elements) * sizeof(double)));
+    elements_ = elements;
+    launched_ = false;
+  }
+
+  void wait_locked(hipStream_t stream) {
+    if (launched_)
+      HIC_CHECK(hipStreamWaitEvent(stream, completion_event_, 0));
+  }
+
+  void record_locked(hipStream_t stream) {
+    HIC_CHECK(hipEventRecord(completion_event_, stream));
+    launched_ = true;
+  }
+
+  double *data() const { return data_; }
+  std::mutex &mutex() { return mutex_; }
+
+private:
+  double *data_ = nullptr;
+  int64_t elements_ = 0;
+  int device_ = 0;
+  bool launched_ = false;
+  hipEvent_t completion_event_{};
+  std::mutex mutex_;
+};
+
+inline std::shared_ptr<cutlass_dgemm_ordered_scratch_pool>
+get_cutlass_dgemm_ordered_scratch_pool() {
+  static std::mutex pools_mutex;
+  static std::unordered_map<
+      int, std::weak_ptr<cutlass_dgemm_ordered_scratch_pool>>
+      pools;
+  int device;
+  HIC_CHECK(hipGetDevice(&device));
+  std::lock_guard<std::mutex> lock(pools_mutex);
+  auto pool = pools[device].lock();
+  if (!pool) {
+    pool = std::make_shared<cutlass_dgemm_ordered_scratch_pool>();
+    pools[device] = pool;
+  }
+  return pool;
+}
+
+__global__ void cutlass_dgemm_ordered_reduce_kernel(
+    const double *partial, double *output, const int64_t *target_offsets,
+    const int64_t *contribution_starts, const int *contribution_counts,
+    const int64_t *partial_offsets, int m, int output_columns) {
+  const int64_t index =
+      static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t element_count =
+      static_cast<int64_t>(m) * output_columns;
+  if (index >= element_count)
+    return;
+
+  const int row = static_cast<int>(index % m);
+  const int column = static_cast<int>(index / m);
+  const int64_t target = target_offsets[column] + row;
+  const int64_t begin = contribution_starts[column];
+  const int count = contribution_counts[column];
+  double value = output[target];
+  for (int contribution = 0; contribution < count; ++contribution)
+    value += partial[partial_offsets[begin + contribution] + row];
+  output[target] = value;
+}
+
+template <cublasOperation_t TransA, cublasOperation_t TransB>
+class cutlass_dgemm_grouped_ordered_entry {
+  using grouped_entry = cutlass_dgemm_grouped_entry<TransA, TransB>;
+
+public:
+  cutlass_dgemm_grouped_ordered_entry(
+      int m, const int *n, const int *k, double alpha, const double *A,
+      int lda, const int64_t *offsetsA, const double *B, const int *ldb,
+      const int64_t *offsetsB, double *C, int ldc,
+      const int64_t *offsetsC, int batchCount, hipStream_t stream)
+      : m_(m), output_(C) {
+    std::vector<int64_t> scratch_offsets(batchCount, 0);
+    std::map<int64_t, std::vector<int64_t>> contributions;
+    int64_t partial_elements = 0;
+
+    for (int group = 0; group < batchCount; ++group) {
+      if (m == 0 || n[group] == 0 || k[group] == 0)
+        continue;
+      scratch_offsets[group] = partial_elements;
+      for (int column = 0; column < n[group]; ++column) {
+        contributions[offsetsC[group] + static_cast<int64_t>(column) * ldc]
+            .push_back(partial_elements + static_cast<int64_t>(column) * m);
+      }
+      partial_elements += static_cast<int64_t>(m) * n[group];
+    }
+
+    pool_ = get_cutlass_dgemm_ordered_scratch_pool();
+    std::vector<int64_t> target_offsets;
+    std::vector<int64_t> contribution_starts;
+    std::vector<int> contribution_counts;
+    std::vector<int64_t> partial_offsets;
+    target_offsets.reserve(contributions.size());
+    contribution_starts.reserve(contributions.size());
+    contribution_counts.reserve(contributions.size());
+    for (const auto &item : contributions) {
+      target_offsets.push_back(item.first);
+      contribution_starts.push_back(partial_offsets.size());
+      contribution_counts.push_back(static_cast<int>(item.second.size()));
+      partial_offsets.insert(partial_offsets.end(), item.second.begin(),
+                             item.second.end());
+    }
+    output_columns_ = static_cast<int>(target_offsets.size());
+    target_offsets_.assign(target_offsets);
+    contribution_starts_.assign(contribution_starts);
+    contribution_counts_.assign(contribution_counts);
+    partial_offsets_.assign(partial_offsets);
+
+    {
+      std::lock_guard<std::mutex> lock(pool_->mutex());
+      pool_->ensure_locked(partial_elements);
+      gemm_ = std::make_unique<grouped_entry>(
+          m, n, k, alpha, A, lda, offsetsA, B, ldb, offsetsB, 0.0,
+          pool_->data(), m, scratch_offsets.data(), batchCount, stream);
+    }
+    partial_elements_ = partial_elements;
+  }
+
+  int problem_count() const { return gemm_->problem_count(); }
+  int threadblock_count() const { return gemm_->threadblock_count(); }
+  int64_t partial_elements() const { return partial_elements_; }
+
+  void run(hipStream_t stream) {
+    std::lock_guard<std::mutex> lock(pool_->mutex());
+    pool_->ensure_locked(partial_elements_);
+    pool_->wait_locked(stream);
+    gemm_->update_output_base(pool_->data(), stream);
+    gemm_->run(stream);
+    const int64_t element_count =
+        static_cast<int64_t>(m_) * output_columns_;
+    constexpr int threads = 256;
+    const int blocks = static_cast<int>((element_count + threads - 1) / threads);
+    cutlass_dgemm_ordered_reduce_kernel<<<blocks, threads, 0, stream>>>(
+        pool_->data(), output_, target_offsets_.get(),
+        contribution_starts_.get(), contribution_counts_.get(),
+        partial_offsets_.get(), m_, output_columns_);
+    HIC_CHECK(cudaGetLastError());
+    pool_->record_locked(stream);
+  }
+
+private:
+  int m_ = 0;
+  int output_columns_ = 0;
+  int64_t partial_elements_ = 0;
+  double *output_ = nullptr;
+  std::shared_ptr<cutlass_dgemm_ordered_scratch_pool> pool_;
+  cutlass_device_array<int64_t> target_offsets_;
+  cutlass_device_array<int64_t> contribution_starts_;
+  cutlass_device_array<int> contribution_counts_;
+  cutlass_device_array<int64_t> partial_offsets_;
+  std::unique_ptr<grouped_entry> gemm_;
 };
 
 } // namespace detail
@@ -465,6 +683,92 @@ void cutlass_dgemm_wrapper_grouped_true(
         synchronize);
   else if (transa == CUBLAS_OP_T && transb == CUBLAS_OP_T)
     cutlass_dgemm_wrapper_grouped_op<CUBLAS_OP_T, CUBLAS_OP_T>(
+        resol_id, blas_id, m, n, k, alpha, A, lda, offsetsA, B, ldb, offsetsB,
+        beta, C, ldc, offsetsC, batchCount, stream, growing_allocator,
+        synchronize);
+  else
+    assert(false);
+}
+
+template <cublasOperation_t TransA, cublasOperation_t TransB>
+void cutlass_dgemm_wrapper_grouped_ordered_op(
+    int resol_id, int blas_id, int m, const int *n, const int *k, double alpha,
+    const double *A, int lda, const int64_t *offsetsA, const double *B,
+    const int *ldb, const int64_t *offsetsB, double beta, double *C, int ldc,
+    const int64_t *offsetsC, int batchCount, hipStream_t stream,
+    void *growing_allocator, bool synchronize) {
+  using Entry =
+      detail::cutlass_dgemm_grouped_ordered_entry<TransA, TransB>;
+  const auto key = make_cache_key(
+      resol_id, blas_id, static_cast<int>(TransA), static_cast<int>(TransB), m,
+      n, k, alpha, A, lda, offsetsA, B, ldb, offsetsB, beta, C, ldc, offsetsC,
+      batchCount);
+
+  {
+    std::lock_guard<std::mutex> registration_lock(
+        growing_allocator_registration_mutex);
+    growing_allocator_register_free_c(
+        growing_allocator, free_cutlass_dgemm_grouped_cache<Entry>);
+  }
+
+  auto &state = get_cutlass_dgemm_grouped_cache_state<Entry>();
+  std::shared_ptr<Entry> entry;
+  bool cache_miss = false;
+  {
+    std::lock_guard<std::mutex> lock(state.mutex);
+    auto found = state.entries.find(key);
+    cache_miss = found == state.entries.end();
+    if (cache_miss) {
+      entry = std::make_shared<Entry>(m, n, k, alpha, A, lda, offsetsA, B,
+                                      ldb, offsetsB, C, ldc, offsetsC,
+                                      batchCount, stream);
+      state.entries.emplace(key, entry);
+    } else {
+      entry = found->second;
+    }
+  }
+
+  if (graph_debug_enabled()) {
+    std::fprintf(
+        stderr,
+        "EC_CUTLASS_ORDERED_DP event=run rank=%s resol=%d blas=%d "
+        "groups=%d threadblocks=%d partial_mib=%.3f cache=%s\n",
+        graph_debug_rank(), resol_id, blas_id, entry->problem_count(),
+        entry->threadblock_count(),
+        static_cast<double>(entry->partial_elements()) * sizeof(double) /
+            (1024.0 * 1024.0),
+        cache_miss ? "miss" : "hit");
+    std::fflush(stderr);
+  }
+  entry->run(stream);
+  if (synchronize)
+    HIC_CHECK(hipStreamSynchronize(stream));
+}
+
+void cutlass_dgemm_wrapper_grouped_ordered_true(
+    int resol_id, int blas_id, cublasOperation_t transa,
+    cublasOperation_t transb, int m, const int *n, const int *k, double alpha,
+    const double *A, int lda, const int64_t *offsetsA, const double *B,
+    const int *ldb, const int64_t *offsetsB, double beta, double *C, int ldc,
+    const int64_t *offsetsC, int batchCount, hipStream_t stream,
+    void *growing_allocator, bool synchronize) {
+  if (transa == CUBLAS_OP_N && transb == CUBLAS_OP_N)
+    cutlass_dgemm_wrapper_grouped_ordered_op<CUBLAS_OP_N, CUBLAS_OP_N>(
+        resol_id, blas_id, m, n, k, alpha, A, lda, offsetsA, B, ldb, offsetsB,
+        beta, C, ldc, offsetsC, batchCount, stream, growing_allocator,
+        synchronize);
+  else if (transa == CUBLAS_OP_N && transb == CUBLAS_OP_T)
+    cutlass_dgemm_wrapper_grouped_ordered_op<CUBLAS_OP_N, CUBLAS_OP_T>(
+        resol_id, blas_id, m, n, k, alpha, A, lda, offsetsA, B, ldb, offsetsB,
+        beta, C, ldc, offsetsC, batchCount, stream, growing_allocator,
+        synchronize);
+  else if (transa == CUBLAS_OP_T && transb == CUBLAS_OP_N)
+    cutlass_dgemm_wrapper_grouped_ordered_op<CUBLAS_OP_T, CUBLAS_OP_N>(
+        resol_id, blas_id, m, n, k, alpha, A, lda, offsetsA, B, ldb, offsetsB,
+        beta, C, ldc, offsetsC, batchCount, stream, growing_allocator,
+        synchronize);
+  else if (transa == CUBLAS_OP_T && transb == CUBLAS_OP_T)
+    cutlass_dgemm_wrapper_grouped_ordered_op<CUBLAS_OP_T, CUBLAS_OP_T>(
         resol_id, blas_id, m, n, k, alpha, A, lda, offsetsA, B, ldb, offsetsB,
         beta, C, ldc, offsetsC, batchCount, stream, growing_allocator,
         synchronize);
