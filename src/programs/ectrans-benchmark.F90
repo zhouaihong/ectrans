@@ -1463,8 +1463,12 @@ subroutine initialize_2d_spectral_field(nsmax, field)
   real(kind=jprb), intent(inout) :: field(:) ! Field to initialize
 
   integer :: num_my_zon_wns
+  integer :: ilength, istatus, m, n, index
   logical, save :: lreported = .false.
+  logical :: lbroad_spectrum
   integer, allocatable :: my_zon_wns(:)
+  integer, allocatable :: nasm0(:)
+  character(len=16) :: env_value
 
   ! Choose a spherical harmonic to initialize arrays
   integer, parameter :: m_num = 4  ! Zonal wavenumber
@@ -1478,12 +1482,27 @@ subroutine initialize_2d_spectral_field(nsmax, field)
   allocate(my_zon_wns(num_my_zon_wns))
   call trans_inq(kmyms=my_zon_wns)
 
+  call get_environment_variable('ECTRANS_BENCHMARK_BROAD_SPECTRUM', env_value, &
+    & length=ilength, status=istatus)
+  lbroad_spectrum = istatus == 0 .and. ilength > 0 .and. env_value(1:1) == '1'
+  if (lbroad_spectrum) then
+    allocate(nasm0(0:nsmax))
+    call trans_inq(kasm0=nasm0)
+    do m = 1, num_my_zon_wns
+      do n = my_zon_wns(m), nsmax
+        index = nasm0(my_zon_wns(m)) + 2 * (n - my_zon_wns(m)) + 1
+        field(index) = sin(0.013_jprb * real((my_zon_wns(m) + 1) * (n + 1), jprb))
+        if (my_zon_wns(m) > 0) then
+          field(index + 1) = cos(0.017_jprb * real((my_zon_wns(m) + 1) * (n + 1), jprb))
+        endif
+      enddo
+    enddo
+    return
+  endif
+
   ! If rank is responsible for the chosen zonal wavenumber...
   if (any(my_zon_wns == m_num) ) then
     block
-      integer, allocatable :: nasm0(:)
-      integer :: index
-
       ! Get array of spectral array addresses (this maps (m, n=m) to array index)
       allocate(nasm0(0:nsmax))
       call trans_inq(kasm0=nasm0)
