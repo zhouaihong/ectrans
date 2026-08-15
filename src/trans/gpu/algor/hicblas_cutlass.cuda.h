@@ -286,8 +286,8 @@ class cutlass_dgemm_grouped_entry {
           double, LayoutA, cutlass::ComplexTransform::kNone, 1, double,
           LayoutB, cutlass::ComplexTransform::kNone, 1, double, LayoutC,
           double, cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80,
-          cutlass::gemm::GemmShape<64, 64, 16>,
-          cutlass::gemm::GemmShape<32, 32, 16>,
+          cutlass::gemm::GemmShape<16, 128, 16>,
+          cutlass::gemm::GemmShape<16, 32, 16>,
           cutlass::gemm::GemmShape<8, 8, 4>,
           cutlass::epilogue::thread::LinearCombination<double, 1, double,
                                                         double>,
@@ -750,9 +750,10 @@ void cutlass_dgemm_wrapper_grouped_op(
   if (graph_debug_enabled()) {
     std::fprintf(stderr,
                  "EC_CUTLASS_GROUPED_DP event=run rank=%s resol=%d blas=%d "
-                 "groups=%d threadblocks=%d cache=%s\n",
-                 graph_debug_rank(), resol_id, blas_id, entry->problem_count(),
-                 entry->threadblock_count(), cache_miss ? "miss" : "hit");
+                 "m=%d groups=%d threadblocks=%d cache=%s\n",
+                 graph_debug_rank(), resol_id, blas_id, m,
+                 entry->problem_count(), entry->threadblock_count(),
+                 cache_miss ? "miss" : "hit");
     std::fflush(stderr);
   }
   entry->run(stream);
@@ -833,9 +834,9 @@ void cutlass_dgemm_wrapper_grouped_ordered_op(
     std::fprintf(
         stderr,
         "EC_CUTLASS_ORDERED_DP event=run rank=%s resol=%d blas=%d "
-        "groups=%d threadblocks=%d mode=%s layers=%d partial_mib=%.3f "
+        "m=%d groups=%d threadblocks=%d mode=%s layers=%d partial_mib=%.3f "
         "cache=%s\n",
-        graph_debug_rank(), resol_id, blas_id, entry->problem_count(),
+        graph_debug_rank(), resol_id, blas_id, m, entry->problem_count(),
         entry->threadblock_count(), entry->mode(), entry->layer_count(),
         static_cast<double>(entry->partial_elements()) * sizeof(double) /
             (1024.0 * 1024.0),
