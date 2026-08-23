@@ -971,6 +971,20 @@ void hipblas_dgemm_wrapper_grouped(int resol_id, int blas_id, char transa,
               alpha, A, lda, offsetsA, B, ldb, offsetsB, beta, C, ldc,
               offsetsC, batchCount, stream, blas_id, synchronize);
   } else {
+    int activeGroups = 0;
+    if (beta == 0.0) {
+      for (int i = 0; i < batchCount && activeGroups < 2; ++i)
+        if (m != 0 && n[i] != 0 && k[i] != 0)
+          ++activeGroups;
+    }
+    const bool dagCanWarmItself = activeGroups >= 2;
+    if (dagCanWarmItself) {
+      run_dgemm_graph_dag(op_t1, op_t2, key, m, n, k, alpha, A, lda,
+                          offsetsA, B, ldb, offsetsB, beta, C, ldc, offsetsC,
+                          batchCount, stream, growing_allocator, synchronize);
+      return;
+    }
+
     {
       std::lock_guard<std::mutex> registration_lock(
           growing_allocator_registration_mutex);
