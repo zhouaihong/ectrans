@@ -796,7 +796,8 @@ do jstep = 1, iters+iters_warmup
     endif
     call gstats(6,1)
   else
-    write(nout,'("Time step ",i6," took", f8.4)') jstep, ztstep(jstep)
+    write(nout,'("Time step ",i6," took",f8.4," inv",f8.4," dir",f8.4)') &
+      & jstep, ztstep(jstep), ztstep1(jstep), ztstep2(jstep)
   endif
   call gstats(3,1)
 enddo
