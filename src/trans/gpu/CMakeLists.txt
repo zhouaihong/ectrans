@@ -40,6 +40,34 @@ else()
   ecbuild_info("warn: HIP and CUDA not found")
 endif()
 
+set( ECTRANS_NVHPC_GPU_ARCH_OPTION "" )
+if( HAVE_CUDA AND HAVE_ACC AND CMAKE_Fortran_COMPILER_ID MATCHES "NVHPC" )
+  set( _ectrans_nvhpc_gpu_arches )
+  foreach( _arch IN LISTS CMAKE_CUDA_ARCHITECTURES )
+    string( REGEX MATCH "^[0-9]+" _arch_number "${_arch}" )
+    if( _arch_number )
+      list( APPEND _ectrans_nvhpc_gpu_arches "cc${_arch_number}" )
+    endif()
+  endforeach()
+  list( REMOVE_DUPLICATES _ectrans_nvhpc_gpu_arches )
+  list( JOIN _ectrans_nvhpc_gpu_arches "," _ectrans_nvhpc_gpu_arch_list )
+  if( _ectrans_nvhpc_gpu_arch_list )
+    string( REGEX MATCH "^[0-9]+\\.[0-9]+" _ectrans_cuda_version "${CUDAToolkit_VERSION}" )
+    set( ECTRANS_NVHPC_GPU_ARCH_OPTION
+      "-gpu=${_ectrans_nvhpc_gpu_arch_list},cuda${_ectrans_cuda_version}" )
+    ecbuild_info( "nvhpc openacc gpu option: [${ECTRANS_NVHPC_GPU_ARCH_OPTION}]" )
+  endif()
+endif()
+
+function( ectrans_target_nvhpc_gpu_arch target visibility )
+  if( ECTRANS_NVHPC_GPU_ARCH_OPTION )
+    target_compile_options( ${target} ${visibility}
+      $<$<COMPILE_LANGUAGE:Fortran>:${ECTRANS_NVHPC_GPU_ARCH_OPTION}> )
+    target_link_options( ${target} ${visibility}
+      $<$<LINK_LANGUAGE:Fortran>:${ECTRANS_NVHPC_GPU_ARCH_OPTION}> )
+  endif()
+endfunction()
+
 
 set( GPU_LIBRARY_TYPE SHARED )
 if( HAVE_GPU_STATIC )
@@ -72,6 +100,7 @@ ecbuild_target_fortran_module_directory(
   MODULE_DIRECTORY         ${PROJECT_BINARY_DIR}/module/ectrans
   INSTALL_MODULE_DIRECTORY module/ectrans
 )
+ectrans_target_nvhpc_gpu_arch( ectrans_gpu_common PRIVATE )
 
 
 
@@ -170,6 +199,7 @@ foreach( prec dp sp )
           MODULE_DIRECTORY         ${CMAKE_BINARY_DIR}/module/ectrans
           INSTALL_MODULE_DIRECTORY module/ectrans
         )
+        ectrans_target_nvhpc_gpu_arch( ectrans_gpu_${prec} PUBLIC )
 
         if( prec STREQUAL sp )
           target_compile_definitions( ectrans_gpu_${prec} PRIVATE TRANS_SINGLE PARKINDTRANS_SINGLE )
