@@ -783,37 +783,69 @@ void run_dgemm_graph_dag(
       laneGroups[lane].push_back(groupIndex);
       laneWork[lane] += static_cast<uint64_t>(n[groupIndex]) * k[groupIndex];
     }
+    const auto scheduleEnd =
+        debug ? graph_debug_clock::now() : graph_debug_clock::time_point{};
 
     int device;
     HIC_CHECK(hipGetDevice(&device));
     std::vector<hipStream_t> laneStreams(lanes);
     std::vector<std::unique_ptr<hipblas_handle_owner>> laneHandles;
     laneHandles.reserve(lanes);
+    double streamCreateMs = 0.0;
+    double handleCreateMs = 0.0;
+    double warmupEnqueueMs = 0.0;
+    double warmupSyncMs = 0.0;
 
     // Lane-handle warmup must not pass work already queued on the caller's
     // OpenACC stream. This synchronization only occurs while building a graph.
     HIC_CHECK(hipStreamSynchronize(stream));
+    const auto callerSyncEnd =
+        debug ? graph_debug_clock::now() : graph_debug_clock::time_point{};
     for (int lane = 0; lane < lanes; ++lane) {
+      const auto streamCreateStart =
+          debug ? graph_debug_clock::now() : graph_debug_clock::time_point{};
       HIC_CHECK(hipStreamCreate(&laneStreams[lane]));
+      const auto streamCreateEnd =
+          debug ? graph_debug_clock::now() : graph_debug_clock::time_point{};
       laneHandles.emplace_back(std::make_unique<hipblas_handle_owner>(device));
+      const auto handleCreateEnd =
+          debug ? graph_debug_clock::now() : graph_debug_clock::time_point{};
       const int warmupIndex = laneGroups[lane].front();
       submit_hipblas_dgemm(
           laneHandles[lane]->get(), transa, transb, laneStreams[lane], m,
           n[warmupIndex], k[warmupIndex], alpha, A + offsetsA[warmupIndex], lda,
           B + offsetsB[warmupIndex], ldb[warmupIndex], beta,
           C + offsetsC[warmupIndex], ldc);
+      const auto warmupEnqueueEnd =
+          debug ? graph_debug_clock::now() : graph_debug_clock::time_point{};
       HIC_CHECK(hipStreamSynchronize(laneStreams[lane]));
+      if (debug) {
+        const auto warmupSyncEnd = graph_debug_clock::now();
+        streamCreateMs +=
+            graph_debug_ms(streamCreateStart, streamCreateEnd);
+        handleCreateMs += graph_debug_ms(streamCreateEnd, handleCreateEnd);
+        warmupEnqueueMs +=
+            graph_debug_ms(handleCreateEnd, warmupEnqueueEnd);
+        warmupSyncMs += graph_debug_ms(warmupEnqueueEnd, warmupSyncEnd);
+      }
     }
 
+    const auto eventCreateStart =
+        debug ? graph_debug_clock::now() : graph_debug_clock::time_point{};
     hipEvent_t forkEvent;
     HIC_CHECK(hipEventCreateWithFlags(&forkEvent, hipEventDisableTiming));
     std::vector<hipEvent_t> completionEvents(lanes - 1);
     for (hipEvent_t &completionEvent : completionEvents)
       HIC_CHECK(
           hipEventCreateWithFlags(&completionEvent, hipEventDisableTiming));
+    const auto eventCreateEnd =
+        debug ? graph_debug_clock::now() : graph_debug_clock::time_point{};
 
+    const auto captureBeginStart = eventCreateEnd;
     HIC_CHECK(hipStreamBeginCapture(laneStreams[0],
                                     hipStreamCaptureModeGlobal));
+    const auto captureBeginEnd =
+        debug ? graph_debug_clock::now() : graph_debug_clock::time_point{};
     HIC_CHECK(hipEventRecord(forkEvent, laneStreams[0]));
     for (int lane = 1; lane < lanes; ++lane)
       HIC_CHECK(hipStreamWaitEvent(laneStreams[lane], forkEvent, 0));
@@ -832,15 +864,25 @@ void run_dgemm_graph_dag(
       HIC_CHECK(hipStreamWaitEvent(laneStreams[0],
                                    completionEvents[lane - 1], 0));
     }
+    const auto captureEnqueueEnd =
+        debug ? graph_debug_clock::now() : graph_debug_clock::time_point{};
 
     hipGraph_t graphRaw;
     HIC_CHECK(hipStreamEndCapture(laneStreams[0], &graphRaw));
+    const auto captureEnd =
+        debug ? graph_debug_clock::now() : graph_debug_clock::time_point{};
     hic_graph_owner capturedGraph{graphRaw};
 
+    const auto instantiateStart = captureEnd;
     hipGraphExec_t instance;
     HIC_CHECK(hipGraphInstantiate(&instance, capturedGraph.get(), nullptr,
                                   nullptr, 0));
+    const auto instantiateEnd =
+        debug ? graph_debug_clock::now() : graph_debug_clock::time_point{};
+    const auto handleDestroyStart = instantiateEnd;
     laneHandles.clear();
+    const auto handleDestroyEnd =
+        debug ? graph_debug_clock::now() : graph_debug_clock::time_point{};
     HIC_CHECK(hipEventDestroy(forkEvent));
     for (hipEvent_t completionEvent : completionEvents)
       HIC_CHECK(hipEventDestroy(completionEvent));
@@ -859,10 +901,25 @@ void run_dgemm_graph_dag(
           "EC_GRAPH_DEBUG event=build mode=dag rank=%s pid=%ld seq=%" PRIu64
           " precision=f64 resol=%d m=%d blas=%d batch=%d active=%zu lanes=%d "
           "lane_work_min=%" PRIu64 " lane_work_max=%" PRIu64
+          " schedule_ms=%.3f caller_sync_ms=%.3f stream_create_ms=%.3f "
+          "handle_create_ms=%.3f warmup_enqueue_ms=%.3f warmup_sync_ms=%.3f "
+          "event_create_ms=%.3f capture_begin_ms=%.3f capture_enqueue_ms=%.3f "
+          "capture_end_ms=%.3f instantiate_ms=%.3f handle_destroy_ms=%.3f "
+          "cleanup_ms=%.3f "
           " build_total_ms=%.3f\n",
           graph_debug_rank(), static_cast<long>(getpid()), sequence,
           key.resol_id, m, key.blas_id, batchCount, active.size(), lanes,
-          *minimum, *maximum, graph_debug_ms(buildStart, buildEnd));
+          *minimum, *maximum, graph_debug_ms(buildStart, scheduleEnd),
+          graph_debug_ms(scheduleEnd, callerSyncEnd), streamCreateMs,
+          handleCreateMs, warmupEnqueueMs, warmupSyncMs,
+          graph_debug_ms(eventCreateStart, eventCreateEnd),
+          graph_debug_ms(captureBeginStart, captureBeginEnd),
+          graph_debug_ms(captureBeginEnd, captureEnqueueEnd),
+          graph_debug_ms(captureEnqueueEnd, captureEnd),
+          graph_debug_ms(instantiateStart, instantiateEnd),
+          graph_debug_ms(handleDestroyStart, handleDestroyEnd),
+          graph_debug_ms(handleDestroyEnd, buildEnd),
+          graph_debug_ms(buildStart, buildEnd));
       std::fflush(stderr);
     }
   }
