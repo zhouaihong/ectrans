@@ -1,7 +1,11 @@
 #include "hicfft.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
 #include <memory>
+#include <thread>
 
 #include "growing_allocator.h"
 #include "hicgraph.h"
@@ -29,6 +33,31 @@
 // }
 
 namespace {
+using steady_clock = std::chrono::steady_clock;
+
+bool fft_warmup_debug() {
+  const char *value = std::getenv("ECTRANS_GPU_WARMUP_DEBUG");
+  return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+int fft_plan_threads() {
+#if CUDAGPU
+  const char *value = std::getenv("ECTRANS_FFT_PLAN_THREADS");
+  if (value != nullptr) {
+    char *end = nullptr;
+    const long parsed = std::strtol(value, &end, 10);
+    if (end != value && *end == '\0' && parsed > 1)
+      return static_cast<int>(std::min(parsed, 64L));
+  }
+#endif
+  return 1;
+}
+
+double elapsed_ms(steady_clock::time_point begin,
+                  steady_clock::time_point end) {
+  return std::chrono::duration<double, std::milli>(end - begin).count();
+}
+
 struct Double {
   using real = double;
   using cmplx = hipfftDoubleComplex;
@@ -147,16 +176,46 @@ std::vector<hicfft_plan<Type, Direction>> plan_all(int resol_id, int kfield, int
     // the fft plans do not exist yet
     std::vector<hicfft_plan<Type, Direction>> newPlans;
     newPlans.reserve(nfft);
-    for (int i = 0; i < nfft; ++i) {
+    std::vector<hipfftHandle> handles(nfft);
+    auto create_plan = [&](int i) {
       int nloen = loens[i];
 
-      hipfftHandle plan;
       int dist = offsets[i + 1] - offsets[i];
       int embed[] = {1};
       fftSafeCall(hipfftPlanMany(
-          &plan, 1, &nloen, embed, 1, is_forward ? dist : dist / 2, embed, 1,
+          &handles[i], 1, &nloen, embed, 1, is_forward ? dist : dist / 2, embed, 1,
           is_forward ? dist / 2 : dist, Direction, kfield));
-      newPlans.emplace_back(plan, kfield * offsets[i]);
+    };
+
+    const auto plan_begin = steady_clock::now();
+    const int plan_threads = std::min(fft_plan_threads(), nfft);
+    if (plan_threads == 1) {
+      for (int i = 0; i < nfft; ++i)
+        create_plan(i);
+    } else {
+      std::atomic<int> next{0};
+      std::vector<std::thread> workers;
+      workers.reserve(plan_threads);
+      for (int thread = 0; thread < plan_threads; ++thread) {
+        workers.emplace_back([&]() {
+          for (int i = next.fetch_add(1); i < nfft; i = next.fetch_add(1))
+            create_plan(i);
+        });
+      }
+      for (auto &worker : workers)
+        worker.join();
+    }
+    const auto plan_end = steady_clock::now();
+
+    for (int i = 0; i < nfft; ++i) {
+      newPlans.emplace_back(handles[i], kfield * offsets[i]);
+    }
+    if (fft_warmup_debug()) {
+      std::cout << "EC_WARMUP_DEBUG event=fft_plan direction="
+                << static_cast<int>(Direction) << " resol=" << resol_id
+                << " kfield=" << kfield << " nfft=" << nfft
+                << " threads=" << plan_threads
+                << " ms=" << elapsed_ms(plan_begin, plan_end) << std::endl;
     }
     fftPlansCache.insert({key, newPlans});
   }
@@ -191,8 +250,10 @@ void run_group_graph(typename Type::real *data_real,
   auto graph = graphCache.find(key);
   if (graph == graphCache.end()) {
     // this graph does not exist yet
+    const auto build_begin = steady_clock::now();
     auto plans =
         plan_all<Type, Direction>(resol_id, kfield, loens, nfft, offsets);
+    const auto plans_ready = steady_clock::now();
 
     // create a temporary stream
     hipStream_t stream;
@@ -233,8 +294,10 @@ void run_group_graph(typename Type::real *data_real,
                                     my_graph.get()));
       child_graphs.push_back(std::move(my_graph));
     }
+    const auto capture_done = steady_clock::now();
     hipGraphExec_t instance;
     HIC_CHECK(hipGraphInstantiate(&instance, new_graph.get(), NULL, NULL, 0));
+    const auto instantiate_done = steady_clock::now();
     child_graphs.clear();
     new_graph.reset();
 #endif
@@ -246,6 +309,19 @@ void run_group_graph(typename Type::real *data_real,
                                   delete ptr;
                                 })});
     ptrCache.insert({key, std::make_pair(data_real, data_complex)});
+    if (fft_warmup_debug()) {
+      std::cout << "EC_WARMUP_DEBUG event=fft_graph direction="
+                << static_cast<int>(Direction) << " resol=" << resol_id
+                << " kfield=" << kfield << " nfft=" << nfft
+                << " plan_ms=" << elapsed_ms(build_begin, plans_ready)
+#if CUDAGPU
+                << " capture_ms=" << elapsed_ms(plans_ready, capture_done)
+                << " instantiate_ms="
+                << elapsed_ms(capture_done, instantiate_done)
+#endif
+                << " total_ms=" << elapsed_ms(build_begin, steady_clock::now())
+                << std::endl;
+    }
   }
 
   /* running in stream 0 */
