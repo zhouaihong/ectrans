@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <memory>
+#include <mutex>
 #include <thread>
 
 #include "growing_allocator.h"
@@ -60,6 +61,20 @@ bool fft_managed_workspace() {
 #else
   return false;
 #endif
+}
+
+bool fft_preplan_opposite() {
+#if CUDAGPU
+  const char *value = std::getenv("ECTRANS_FFT_PREPLAN_OPPOSITE");
+  return value != nullptr && value[0] != '\0' && value[0] != '0';
+#else
+  return false;
+#endif
+}
+
+std::mutex &fft_debug_mutex() {
+  static std::mutex mutex;
+  return mutex;
 }
 
 size_t align_workspace(size_t bytes) {
@@ -270,6 +285,7 @@ std::vector<hicfft_plan<Type, Direction>> plan_all(int resol_id, int kfield, int
                             managed_workspace ? workspace_offsets[i] : 0);
     }
     if (fft_warmup_debug()) {
+      std::lock_guard<std::mutex> lock(fft_debug_mutex());
       std::cout << "EC_WARMUP_DEBUG event=fft_plan direction="
                 << static_cast<int>(Direction) << " resol=" << resol_id
                 << " kfield=" << kfield << " nfft=" << nfft
@@ -375,6 +391,7 @@ void run_group_graph(typename Type::real *data_real,
                                 })});
     ptrCache.insert({key, std::make_pair(data_real, data_complex)});
     if (fft_warmup_debug()) {
+      std::lock_guard<std::mutex> lock(fft_debug_mutex());
       std::cout << "EC_WARMUP_DEBUG event=fft_graph direction="
                 << static_cast<int>(Direction) << " resol=" << resol_id
                 << " kfield=" << kfield << " nfft=" << nfft
@@ -404,40 +421,90 @@ void run_group(typename Type::real *data_real,
     plan.exec(data_real, data_complex);
   HIC_CHECK(hipDeviceSynchronize());
 }
+
+template <hipfftType Direction> constexpr hipfftType opposite_direction() {
+  if constexpr (Direction == HIPFFT_R2C)
+    return HIPFFT_C2R;
+  else if constexpr (Direction == HIPFFT_C2R)
+    return HIPFFT_R2C;
+  else if constexpr (Direction == HIPFFT_D2Z)
+    return HIPFFT_Z2D;
+  else
+    return HIPFFT_D2Z;
+}
+
+template <class Type, hipfftType Direction>
+void run_with_opposite_preplan(typename Type::real *data_real,
+                               typename Type::cmplx *data_complex,
+                               int resol_id, int kfield, int *loens,
+                               int64_t *offsets, int nfft,
+                               void *growing_allocator) {
+  static constexpr hipfftType Opposite = opposite_direction<Direction>();
+  const auto key = cache_key{resol_id, kfield};
+  auto &opposite_cache = get_fft_plan_cache<Type, Opposite>();
+  const bool preplan = fft_preplan_opposite() &&
+                       opposite_cache.find(key) == opposite_cache.end();
+  const auto begin = steady_clock::now();
+  std::thread preplan_thread;
+  if (preplan) {
+    preplan_thread = std::thread([=]() {
+      plan_all<Type, Opposite>(resol_id, kfield, loens, nfft, offsets);
+    });
+  }
+
+#ifdef USE_GRAPHS_FFT
+  run_group_graph<Type, Direction>(data_real, data_complex, resol_id, kfield,
+                                   loens, offsets, nfft, growing_allocator);
+#else
+  run_group<Type, Direction>(data_real, data_complex, resol_id, kfield, loens,
+                             offsets, nfft, growing_allocator);
+#endif
+
+  if (preplan_thread.joinable())
+    preplan_thread.join();
+  if (preplan && fft_warmup_debug()) {
+    std::lock_guard<std::mutex> lock(fft_debug_mutex());
+    std::cout << "EC_WARMUP_DEBUG event=fft_preplan direction="
+              << static_cast<int>(Direction)
+              << " opposite=" << static_cast<int>(Opposite)
+              << " resol=" << resol_id << " kfield=" << kfield
+              << " nfft=" << nfft
+              << " total_ms=" << elapsed_ms(begin, steady_clock::now())
+              << std::endl;
+  }
+}
 } // namespace
 
 extern "C" {
-#ifdef USE_GRAPHS_FFT
-#define RUN run_group_graph
-#else
-#define RUN run_group
-#endif
 void execute_dir_fft_float(float *data_real, hipfftComplex *data_complex,
                            int resol_id, int kfield, int *loens, int64_t *offsets, int nfft,
                            void *growing_allocator) {
-  RUN<Float, HIPFFT_R2C>(data_real, data_complex, resol_id, kfield, loens, offsets, nfft,
-                         growing_allocator);
+  run_with_opposite_preplan<Float, HIPFFT_R2C>(
+      data_real, data_complex, resol_id, kfield, loens, offsets, nfft,
+      growing_allocator);
 }
 void execute_inv_fft_float(hipfftComplex *data_complex, float *data_real,
                            int resol_id, int kfield, int *loens, int64_t *offsets, int nfft,
                            void *growing_allocator) {
-  RUN<Float, HIPFFT_C2R>(data_real, data_complex, resol_id, kfield, loens, offsets, nfft,
-                         growing_allocator);
+  run_with_opposite_preplan<Float, HIPFFT_C2R>(
+      data_real, data_complex, resol_id, kfield, loens, offsets, nfft,
+      growing_allocator);
 }
 void execute_dir_fft_double(double *data_real,
                             hipfftDoubleComplex *data_complex, int resol_id, int kfield,
                             int *loens, int64_t *offsets, int nfft,
                             void *growing_allocator) {
-  RUN<Double, HIPFFT_D2Z>(data_real, data_complex, resol_id, kfield, loens,
-                          offsets, nfft, growing_allocator);
+  run_with_opposite_preplan<Double, HIPFFT_D2Z>(
+      data_real, data_complex, resol_id, kfield, loens, offsets, nfft,
+      growing_allocator);
 }
 void execute_inv_fft_double(hipfftDoubleComplex *data_complex,
                             double *data_real, int resol_id, int kfield, int *loens,
                             int64_t *offsets, int nfft, void *growing_allocator) {
-  RUN<Double, HIPFFT_Z2D>(data_real, data_complex, resol_id, kfield, loens, offsets, nfft,
-                          growing_allocator);
+  run_with_opposite_preplan<Double, HIPFFT_Z2D>(
+      data_real, data_complex, resol_id, kfield, loens, offsets, nfft,
+      growing_allocator);
 }
-#undef RUN
 
 void clean_fft(int resol_id) {
   erase_from_caches<Float, HIPFFT_R2C>(resol_id);
