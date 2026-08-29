@@ -68,6 +68,8 @@
 
 // Runtime calls
 #define hipDeviceSynchronize cudaDeviceSynchronize
+#define hipGetDevice cudaGetDevice
+#define hipSetDevice cudaSetDevice
 #define hipStreamSynchronize cudaStreamSynchronize
 #define hipDeviceReset cudaDeviceReset
 #define _hipGetErrorEnum _cudaGetErrorEnum

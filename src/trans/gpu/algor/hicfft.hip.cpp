@@ -247,11 +247,14 @@ std::vector<hicfft_plan<Type, Direction>> plan_all(int resol_id, int kfield, int
       for (int i = 0; i < nfft; ++i)
         create_plan(i);
     } else {
+      int device = 0;
+      HIC_CHECK(hipGetDevice(&device));
       std::atomic<int> next{0};
       std::vector<std::thread> workers;
       workers.reserve(plan_threads);
       for (int thread = 0; thread < plan_threads; ++thread) {
-        workers.emplace_back([&]() {
+        workers.emplace_back([&, device]() {
+          HIC_CHECK(hipSetDevice(device));
           for (int i = next.fetch_add(1); i < nfft; i = next.fetch_add(1))
             create_plan(i);
         });
@@ -447,7 +450,10 @@ void run_with_opposite_preplan(typename Type::real *data_real,
   const auto begin = steady_clock::now();
   std::thread preplan_thread;
   if (preplan) {
+    int device = 0;
+    HIC_CHECK(hipGetDevice(&device));
     preplan_thread = std::thread([=]() {
+      HIC_CHECK(hipSetDevice(device));
       plan_all<Type, Opposite>(resol_id, kfield, loens, nfft, offsets);
     });
   }
