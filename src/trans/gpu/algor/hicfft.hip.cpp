@@ -53,6 +53,20 @@ int fft_plan_threads() {
   return 1;
 }
 
+bool fft_managed_workspace() {
+#if CUDAGPU
+  const char *value = std::getenv("ECTRANS_FFT_MANAGED_WORKSPACE");
+  return value != nullptr && value[0] != '\0' && value[0] != '0';
+#else
+  return false;
+#endif
+}
+
+size_t align_workspace(size_t bytes) {
+  constexpr size_t alignment = 256;
+  return (bytes + alignment - 1) / alignment * alignment;
+}
+
 double elapsed_ms(steady_clock::time_point begin,
                   steady_clock::time_point end) {
   return std::chrono::duration<double, std::milli>(end - begin).count();
@@ -87,15 +101,26 @@ public:
   void set_stream(hipStream_t stream) {
     fftSafeCall(hipfftSetStream(*handle_ptr, stream));
   }
-  hicfft_plan(hipfftHandle handle_, int64_t offset_)
-      : handle_ptr(new hipfftHandle{handle_},
+  hicfft_plan(hipfftHandle handle_, int64_t offset_,
+              std::shared_ptr<void> workspace_ = {},
+              size_t workspace_offset_ = 0)
+      : workspace(std::move(workspace_)),
+        handle_ptr(new hipfftHandle{handle_},
                    [](auto ptr) {
                      fftSafeCall(hipfftDestroy(*ptr));
                      delete ptr;
                    }),
-        offset(offset_) {}
+        offset(offset_) {
+#if CUDAGPU
+    if (workspace)
+      fftSafeCall(hipfftSetWorkArea(
+          *handle_ptr, static_cast<char *>(workspace.get()) + workspace_offset_));
+#endif
+  }
 
 private:
+  // External work memory must outlive the cuFFT handle that refers to it.
+  std::shared_ptr<void> workspace;
   std::shared_ptr<hipfftHandle> handle_ptr;
   int64_t offset;
 };
@@ -177,14 +202,28 @@ std::vector<hicfft_plan<Type, Direction>> plan_all(int resol_id, int kfield, int
     std::vector<hicfft_plan<Type, Direction>> newPlans;
     newPlans.reserve(nfft);
     std::vector<hipfftHandle> handles(nfft);
+    const bool managed_workspace = fft_managed_workspace();
+    std::vector<size_t> workspace_sizes(managed_workspace ? nfft : 0);
     auto create_plan = [&](int i) {
       int nloen = loens[i];
 
       int dist = offsets[i + 1] - offsets[i];
       int embed[] = {1};
-      fftSafeCall(hipfftPlanMany(
-          &handles[i], 1, &nloen, embed, 1, is_forward ? dist : dist / 2, embed, 1,
-          is_forward ? dist / 2 : dist, Direction, kfield));
+#if CUDAGPU
+      if (managed_workspace) {
+        fftSafeCall(hipfftCreate(&handles[i]));
+        fftSafeCall(hipfftSetAutoAllocation(handles[i], 0));
+        fftSafeCall(hipfftMakePlanMany(
+            handles[i], 1, &nloen, embed, 1, is_forward ? dist : dist / 2,
+            embed, 1, is_forward ? dist / 2 : dist, Direction, kfield,
+            &workspace_sizes[i]));
+        return;
+      }
+#endif
+      fftSafeCall(hipfftPlanMany(&handles[i], 1, &nloen, embed, 1,
+                                 is_forward ? dist : dist / 2, embed, 1,
+                                 is_forward ? dist / 2 : dist, Direction,
+                                 kfield));
     };
 
     const auto plan_begin = steady_clock::now();
@@ -207,15 +246,41 @@ std::vector<hicfft_plan<Type, Direction>> plan_all(int resol_id, int kfield, int
     }
     const auto plan_end = steady_clock::now();
 
+    std::shared_ptr<void> workspace;
+    std::vector<size_t> workspace_offsets(managed_workspace ? nfft : 0);
+    size_t workspace_bytes = 0;
+#if CUDAGPU
+    if (managed_workspace) {
+      for (int i = 0; i < nfft; ++i) {
+        workspace_offsets[i] = workspace_bytes;
+        workspace_bytes += align_workspace(workspace_sizes[i]);
+      }
+      if (workspace_bytes > 0) {
+        void *workspace_raw = nullptr;
+        HIC_CHECK(hipMalloc(&workspace_raw, workspace_bytes));
+        workspace.reset(workspace_raw,
+                        [](void *ptr) { HIC_CHECK(hipFree(ptr)); });
+      }
+    }
+#endif
+    const auto allocation_end = steady_clock::now();
+
     for (int i = 0; i < nfft; ++i) {
-      newPlans.emplace_back(handles[i], kfield * offsets[i]);
+      newPlans.emplace_back(handles[i], kfield * offsets[i], workspace,
+                            managed_workspace ? workspace_offsets[i] : 0);
     }
     if (fft_warmup_debug()) {
       std::cout << "EC_WARMUP_DEBUG event=fft_plan direction="
                 << static_cast<int>(Direction) << " resol=" << resol_id
                 << " kfield=" << kfield << " nfft=" << nfft
                 << " threads=" << plan_threads
-                << " ms=" << elapsed_ms(plan_begin, plan_end) << std::endl;
+                << " managed_workspace=" << managed_workspace
+                << " make_ms=" << elapsed_ms(plan_begin, plan_end)
+                << " allocation_ms=" << elapsed_ms(plan_end, allocation_end)
+                << " workspace_mib="
+                << static_cast<double>(workspace_bytes) / (1024.0 * 1024.0)
+                << " ms=" << elapsed_ms(plan_begin, allocation_end)
+                << std::endl;
     }
     fftPlansCache.insert({key, newPlans});
   }

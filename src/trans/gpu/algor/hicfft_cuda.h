@@ -43,8 +43,10 @@
 #define hipfftCreate cufftCreate
 #define hipfftDestroy cufftDestroy
 #define hipfftPlanMany cufftPlanMany
+#define hipfftMakePlanMany cufftMakePlanMany
 #define hipfftGetSize cufftGetSize
 #define hipfftSetAutoAllocation cufftSetAutoAllocation 
+#define hipfftSetWorkArea cufftSetWorkArea
 #define hipfftSetStream cufftSetStream
 #define hipStreamCreate  cudaStreamCreate
 #define hipStreamDestroy  cudaStreamDestroy
