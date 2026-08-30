@@ -456,8 +456,12 @@ void run_with_opposite_preplan(typename Type::real *data_real,
       HIC_CHECK(hipSetDevice(device));
       plan_all<Type, Opposite>(resol_id, kfield, loens, nfft, offsets);
     });
+
+    plan_all<Type, Direction>(resol_id, kfield, loens, nfft, offsets);
+    preplan_thread.join();
   }
 
+  // cuFFT plan creation in another thread invalidates global stream capture.
 #ifdef USE_GRAPHS_FFT
   run_group_graph<Type, Direction>(data_real, data_complex, resol_id, kfield,
                                    loens, offsets, nfft, growing_allocator);
@@ -466,8 +470,6 @@ void run_with_opposite_preplan(typename Type::real *data_real,
                              offsets, nfft, growing_allocator);
 #endif
 
-  if (preplan_thread.joinable())
-    preplan_thread.join();
   if (preplan && fft_warmup_debug()) {
     std::lock_guard<std::mutex> lock(fft_debug_mutex());
     std::cout << "EC_WARMUP_DEBUG event=fft_preplan direction="
