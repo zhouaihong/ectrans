@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -63,6 +64,15 @@ bool fft_managed_workspace() {
 #endif
 }
 
+bool fft_reuse_equivalent_plans() {
+#if CUDAGPU
+  const char *value = std::getenv("ECTRANS_FFT_REUSE_EQUIVALENT_PLANS");
+  return value != nullptr && value[0] != '\0' && value[0] != '0';
+#else
+  return false;
+#endif
+}
+
 bool fft_preplan_opposite() {
 #if CUDAGPU
   const char *value = std::getenv("ECTRANS_FFT_PREPLAN_OPPOSITE");
@@ -113,32 +123,35 @@ public:
     else if constexpr (Direction == HIPFFT_Z2D)
       fftSafeCall(hipfftExecZ2D(*handle_ptr, data_complex_l, data_real_l));
   }
-  void set_stream(hipStream_t stream) {
+  void prepare(hipStream_t stream) {
     fftSafeCall(hipfftSetStream(*handle_ptr, stream));
-  }
-  hicfft_plan(hipfftHandle handle_, int64_t offset_,
-              std::shared_ptr<void> workspace_ = {},
-              size_t workspace_offset_ = 0)
-      : workspace(std::move(workspace_)),
-        handle_ptr(new hipfftHandle{handle_},
-                   [](auto ptr) {
-                     fftSafeCall(hipfftDestroy(*ptr));
-                     delete ptr;
-                   }),
-        offset(offset_) {
 #if CUDAGPU
     if (workspace)
       fftSafeCall(hipfftSetWorkArea(
-          *handle_ptr, static_cast<char *>(workspace.get()) + workspace_offset_));
+          *handle_ptr, static_cast<char *>(workspace.get()) + workspace_offset));
 #endif
   }
+  hicfft_plan(std::shared_ptr<hipfftHandle> handle_, int64_t offset_,
+              std::shared_ptr<void> workspace_ = {},
+              size_t workspace_offset_ = 0)
+      : workspace(std::move(workspace_)),
+        handle_ptr(std::move(handle_)), offset(offset_),
+        workspace_offset(workspace_offset_) {}
 
 private:
   // External work memory must outlive the cuFFT handle that refers to it.
   std::shared_ptr<void> workspace;
   std::shared_ptr<hipfftHandle> handle_ptr;
   int64_t offset;
+  size_t workspace_offset;
 };
+
+std::shared_ptr<hipfftHandle> own_fft_handle(hipfftHandle handle) {
+  return std::shared_ptr<hipfftHandle>(new hipfftHandle{handle}, [](auto ptr) {
+    fftSafeCall(hipfftDestroy(*ptr));
+    delete ptr;
+  });
+}
 
 struct cache_key {
   int resol_id;
@@ -216,36 +229,61 @@ std::vector<hicfft_plan<Type, Direction>> plan_all(int resol_id, int kfield, int
     // the fft plans do not exist yet
     std::vector<hicfft_plan<Type, Direction>> newPlans;
     newPlans.reserve(nfft);
-    std::vector<hipfftHandle> handles(nfft);
     const bool managed_workspace = fft_managed_workspace();
-    std::vector<size_t> workspace_sizes(managed_workspace ? nfft : 0);
-    auto create_plan = [&](int i) {
+    const bool reuse_equivalent_plans =
+        managed_workspace && fft_reuse_equivalent_plans();
+    std::vector<int> operation_to_plan(nfft);
+    std::vector<int> plan_representatives;
+    plan_representatives.reserve(nfft);
+    std::map<std::pair<int, int>, int> equivalent_plans;
+    for (int i = 0; i < nfft; ++i) {
+      const int dist = offsets[i + 1] - offsets[i];
+      if (reuse_equivalent_plans) {
+        const auto signature = std::make_pair(loens[i], dist);
+        auto inserted = equivalent_plans.emplace(
+            signature, static_cast<int>(plan_representatives.size()));
+        operation_to_plan[i] = inserted.first->second;
+        if (inserted.second)
+          plan_representatives.push_back(i);
+      } else {
+        operation_to_plan[i] = i;
+        plan_representatives.push_back(i);
+      }
+    }
+
+    const int unique_plans = static_cast<int>(plan_representatives.size());
+    std::vector<hipfftHandle> handles(unique_plans);
+    std::vector<size_t> plan_workspace_sizes(managed_workspace ? unique_plans
+                                                               : 0);
+    auto create_plan = [&](int plan_index) {
+      const int i = plan_representatives[plan_index];
       int nloen = loens[i];
 
       int dist = offsets[i + 1] - offsets[i];
       int embed[] = {1};
 #if CUDAGPU
       if (managed_workspace) {
-        fftSafeCall(hipfftCreate(&handles[i]));
-        fftSafeCall(hipfftSetAutoAllocation(handles[i], 0));
+        fftSafeCall(hipfftCreate(&handles[plan_index]));
+        fftSafeCall(hipfftSetAutoAllocation(handles[plan_index], 0));
         fftSafeCall(hipfftMakePlanMany(
-            handles[i], 1, &nloen, embed, 1, is_forward ? dist : dist / 2,
+            handles[plan_index], 1, &nloen, embed, 1,
+            is_forward ? dist : dist / 2,
             embed, 1, is_forward ? dist / 2 : dist, Direction, kfield,
-            &workspace_sizes[i]));
+            &plan_workspace_sizes[plan_index]));
         return;
       }
 #endif
-      fftSafeCall(hipfftPlanMany(&handles[i], 1, &nloen, embed, 1,
-                                 is_forward ? dist : dist / 2, embed, 1,
-                                 is_forward ? dist / 2 : dist, Direction,
-                                 kfield));
+      fftSafeCall(hipfftPlanMany(
+          &handles[plan_index], 1, &nloen, embed, 1,
+          is_forward ? dist : dist / 2, embed, 1,
+          is_forward ? dist / 2 : dist, Direction, kfield));
     };
 
     const auto plan_begin = steady_clock::now();
-    const int plan_threads = std::min(fft_plan_threads(), nfft);
+    const int plan_threads = std::min(fft_plan_threads(), unique_plans);
     if (plan_threads == 1) {
-      for (int i = 0; i < nfft; ++i)
-        create_plan(i);
+      for (int plan_index = 0; plan_index < unique_plans; ++plan_index)
+        create_plan(plan_index);
     } else {
       int device = 0;
       HIC_CHECK(hipGetDevice(&device));
@@ -255,8 +293,9 @@ std::vector<hicfft_plan<Type, Direction>> plan_all(int resol_id, int kfield, int
       for (int thread = 0; thread < plan_threads; ++thread) {
         workers.emplace_back([&, device]() {
           HIC_CHECK(hipSetDevice(device));
-          for (int i = next.fetch_add(1); i < nfft; i = next.fetch_add(1))
-            create_plan(i);
+          for (int plan_index = next.fetch_add(1); plan_index < unique_plans;
+               plan_index = next.fetch_add(1))
+            create_plan(plan_index);
         });
       }
       for (auto &worker : workers)
@@ -271,7 +310,8 @@ std::vector<hicfft_plan<Type, Direction>> plan_all(int resol_id, int kfield, int
     if (managed_workspace) {
       for (int i = 0; i < nfft; ++i) {
         workspace_offsets[i] = workspace_bytes;
-        workspace_bytes += align_workspace(workspace_sizes[i]);
+        workspace_bytes += align_workspace(
+            plan_workspace_sizes[operation_to_plan[i]]);
       }
       if (workspace_bytes > 0) {
         void *workspace_raw = nullptr;
@@ -283,8 +323,13 @@ std::vector<hicfft_plan<Type, Direction>> plan_all(int resol_id, int kfield, int
 #endif
     const auto allocation_end = steady_clock::now();
 
+    std::vector<std::shared_ptr<hipfftHandle>> handle_owners;
+    handle_owners.reserve(unique_plans);
+    for (auto handle : handles)
+      handle_owners.push_back(own_fft_handle(handle));
     for (int i = 0; i < nfft; ++i) {
-      newPlans.emplace_back(handles[i], kfield * offsets[i], workspace,
+      newPlans.emplace_back(handle_owners[operation_to_plan[i]],
+                            kfield * offsets[i], workspace,
                             managed_workspace ? workspace_offsets[i] : 0);
     }
     if (fft_warmup_debug()) {
@@ -292,8 +337,10 @@ std::vector<hicfft_plan<Type, Direction>> plan_all(int resol_id, int kfield, int
       std::cout << "EC_WARMUP_DEBUG event=fft_plan direction="
                 << static_cast<int>(Direction) << " resol=" << resol_id
                 << " kfield=" << kfield << " nfft=" << nfft
+                << " unique_plans=" << unique_plans
                 << " threads=" << plan_threads
                 << " managed_workspace=" << managed_workspace
+                << " reuse_equivalent_plans=" << reuse_equivalent_plans
                 << " make_ms=" << elapsed_ms(plan_begin, plan_end)
                 << " allocation_ms=" << elapsed_ms(plan_end, allocation_end)
                 << " workspace_mib="
@@ -343,10 +390,9 @@ void run_group_graph(typename Type::real *data_real,
     hipStream_t stream;
     HIC_CHECK(hipStreamCreate(&stream));
 
-    for (auto &plan : plans) // set the streams
-      plan.set_stream(stream);
-
 #if HIPGPU
+    for (auto &plan : plans)
+      plan.prepare(stream);
     // now create the graph
     HIC_CHECK(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal));
     for (auto &plan : plans) {
@@ -367,6 +413,7 @@ void run_group_graph(typename Type::real *data_real,
     std::vector<hic_graph_owner> child_graphs;
     child_graphs.reserve(plans.size());
     for (auto &plan : plans) {
+      plan.prepare(stream);
       HIC_CHECK(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal));
       plan.exec(data_real, data_complex);
       hipGraph_t my_graph_raw;
@@ -420,8 +467,10 @@ void run_group(typename Type::real *data_real,
                int64_t *offsets, int nfft, void *growing_allocator) {
   auto plans = plan_all<Type, Direction>(resol_id, kfield, loens, nfft, offsets);
 
-  for (auto &plan : plans)
+  for (auto &plan : plans) {
+    plan.prepare(0);
     plan.exec(data_real, data_complex);
+  }
   HIC_CHECK(hipDeviceSynchronize());
 }
 
