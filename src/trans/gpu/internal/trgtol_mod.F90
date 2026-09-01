@@ -663,7 +663,7 @@ CONTAINS
       CALL MPL_BARRIER(CDSTRING='')
       CALL GSTATS(456,1)
     ENDIF
-    CALL GSTATS(412,0)
+    CALL GSTATS(446,0)
     CALL GSTATS(484,0)
     CALL GSTATS(1823,0)
     ACC_POINTERS_CNT = 0
@@ -781,7 +781,7 @@ CONTAINS
       CALL GSTATS(457,1)
     ENDIF
     CALL GSTATS(484,1)
-    CALL GSTATS(412,1)
+    CALL GSTATS(446,1)
 
     ! Figure out processes that send or recv something
     ISEND_COUNTS   = 0
@@ -969,7 +969,7 @@ CONTAINS
       CALL GSTATS(458,1)
     ENDIF
 
-    CALL GSTATS(411,0)
+    CALL GSTATS(445,0)
     CALL GSTATS(460,0)
     IF (IRECV_COUNTS > 0) THEN
       CALL ASSIGN_PTR(ZCOMBUFR, GET_ALLOCATION(ALLOCATOR, HTRGTOL%HCOMBUFR_AND_REEL),&
@@ -1152,7 +1152,7 @@ CONTAINS
       CALL MPL_BARRIER(CDSTRING='')
       CALL GSTATS(459,1)
     ENDIF
-    CALL GSTATS(411,1)
+    CALL GSTATS(445,1)
 
     !  Unpack loop.........................................................
 

@@ -435,7 +435,7 @@ CONTAINS
 
     ! Prepare receiver arrays
     ! find number of fields on a certain V-set
-    CALL GSTATS(1810,0)
+    CALL GSTATS(1818,0)
     IF(NPRTRV == 1) THEN
       ! This is needed because KVSET(JFLD) == -1 if there is only one V-set
       IRECV_FIELD_COUNT(1) = KF_GP
@@ -462,7 +462,7 @@ CONTAINS
       ! total recv size is # points per field * # fields
       IRECVTOT(JROC) = 1_JPIB*IRECV_WSET_SIZE(ISETW)*IRECV_FIELD_COUNT(ISETV)
     ENDDO
-    CALL GSTATS(1810,1)
+    CALL GSTATS(1818,1)
 
     ! Prepare sender arrays
     CALL GSTATS(1811,0)
@@ -628,7 +628,8 @@ CONTAINS
       ENDDO
     ENDDO
     CALL GSTATS(1815,1)
-   
+
+    CALL GSTATS(469,0)
 #ifdef OMPGPU
     !$OMP TARGET DATA MAP(TO:IFLDA)
 #endif
@@ -647,7 +648,7 @@ CONTAINS
       IRECV_WSET_SIZE_V = IRECV_WSET_SIZE(MYSETW)
       IIN_TO_SEND_BUFR_V = IIN_TO_SEND_BUFR_OFFSET(MYPROC)
       IF (PRESENT(PGP)) THEN
-        CALL GSTATS(1607,0)
+        CALL GSTATS(467,0)
 #ifdef OMPGPU
         !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) DEFAULT(NONE) &
         !$OMP& PRIVATE(JK,JBLK,IFLD,IPOS) &
@@ -670,9 +671,9 @@ CONTAINS
             PGP(JK,IFLD,JBLK) = PREEL_REAL(IPOS)
           ENDDO
         ENDDO
-        CALL GSTATS(1607,1)
+        CALL GSTATS(467,1)
       ELSE
-        CALL GSTATS(1608,0)
+        CALL GSTATS(468,0)
 #ifdef OMPGPU
         !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) DEFAULT(NONE) &
         !$OMP& PRIVATE(JK,JBLK,IFLD,IPOS) &
@@ -703,7 +704,7 @@ CONTAINS
             ENDIF
           ENDDO
         ENDDO
-        CALL GSTATS(1608,1)
+        CALL GSTATS(468,1)
       ENDIF
       CALL GSTATS(1604,1)
     ENDIF
@@ -771,6 +772,7 @@ CONTAINS
 
     !$ACC WAIT(1)
 #endif
+    CALL GSTATS(469,1)
 
     CALL GSTATS(805,0)
 
@@ -791,7 +793,7 @@ CONTAINS
     !$ACC HOST_DATA USE_DEVICE(ZCOMBUFS,ZCOMBUFR)
 #endif
 #else
-    CALL GSTATS(433,0)
+    CALL GSTATS(438,0)
 #ifdef OMPGPU
     !$OMP TARGET UPDATE FROM(ZCOMBUFS) IF(ISEND_COUNTS > 0)
 #endif
@@ -799,11 +801,11 @@ CONTAINS
     !! this is safe-but-slow fallback for running without GPU-aware MPI
     !$ACC UPDATE HOST(ZCOMBUFS) IF(ISEND_COUNTS > 0)
 #endif
-    CALL GSTATS(433,1)
+    CALL GSTATS(438,1)
 #endif
 
     ! Skip the own contribution because this is ok to overflow
-    CALL GSTATS(809,0)
+    CALL GSTATS(466,0)
     ISENDTOT(MYPROC) = 0
     IRECVTOT(MYPROC) = 0
 
@@ -813,9 +815,9 @@ CONTAINS
       & CALL MPL_ABORT("Overflow in trltog")
     IF (ANY(IRECVTOT_MPI /= IRECVTOT)) &
       & CALL MPL_ABORT("Overflow in trltog")
-    CALL GSTATS(809,1)
+    CALL GSTATS(466,1)
 
-    CALL GSTATS(806,0)
+    CALL GSTATS(447,0)
     DO INR=1,IRECV_COUNTS
       IR=IR+1
       IRECV=IRECV_TO_PROC(INR)
@@ -830,10 +832,10 @@ CONTAINS
       CALL ABORT_TRANS("Should not be here: MPI is disabled")
 #endif
     ENDDO
-    CALL GSTATS(806,1)
+    CALL GSTATS(447,1)
 
     !...Send loop.........................................................
-    CALL GSTATS(807,0)
+    CALL GSTATS(448,0)
     DO INS=1,ISEND_COUNTS
       IR=IR+1
       ISEND=ISEND_TO_PROC(INS)
@@ -845,13 +847,13 @@ CONTAINS
         CALL ABORT_TRANS("Should not be here: MPI is disabled")
 #endif
     ENDDO
-    CALL GSTATS(807,1)
+    CALL GSTATS(448,1)
 
     IF(IR > 0) THEN
-      CALL GSTATS(808,0)
+      CALL GSTATS(449,0)
       CALL MPL_WAIT(KREQUEST=IREQ(1:IR), &
       & CDSTRING='TRLTOG: WAIT FOR SENDS AND RECEIVES')
-      CALL GSTATS(808,1)
+      CALL GSTATS(449,1)
     ENDIF
 
 #ifdef USE_GPU_AWARE_MPI
@@ -865,14 +867,14 @@ CONTAINS
 #ifdef OMPGPU
 #endif
     !! this is safe-but-slow fallback for running without GPU-aware MPI
-    CALL GSTATS(434,0)
+    CALL GSTATS(439,0)
 #ifdef OMPGPU
     !$OMP TARGET UPDATE TO(ZCOMBUFR) IF(IRECV_COUNTS > 0)
 #endif
 #ifdef ACCGPU
     !$ACC UPDATE DEVICE(ZCOMBUFR) IF(IRECV_COUNTS > 0)
 #endif
-    CALL GSTATS(434,1)
+    CALL GSTATS(439,1)
 #endif
 
     IF (LSYNC_TRANS) THEN
@@ -1027,34 +1029,34 @@ CONTAINS
       CALL GSTATS(428,0)
     ENDIF
     IF (LUPDATE_HOST .AND. PRESENT(PGP2)) THEN
-      CALL GSTATS(430,0)
+      CALL GSTATS(435,0)
 #ifdef OMPGPU
       !$OMP TARGET UPDATE FROM(PGP2)
 #endif
 #ifdef ACCGPU
       !$ACC UPDATE HOST(PGP2) ASYNC(1)
 #endif
-      CALL GSTATS(430,1)
+      CALL GSTATS(435,1)
     ENDIF
     IF (LUPDATE_HOST .AND. PRESENT(PGP3A)) THEN
-      CALL GSTATS(431,0)
+      CALL GSTATS(436,0)
 #ifdef OMPGPU
       !$OMP TARGET UPDATE FROM(PGP3A)
 #endif
 #ifdef ACCGPU
       !$ACC UPDATE HOST(PGP3A) ASYNC(1)
 #endif
-      CALL GSTATS(431,1)
+      CALL GSTATS(436,1)
     ENDIF
     IF (LUPDATE_HOST .AND. PRESENT(PGP3B)) THEN
-      CALL GSTATS(432,0)
+      CALL GSTATS(437,0)
 #ifdef OMPGPU
       !$OMP TARGET UPDATE FROM(PGP3B)
 #endif
 #ifdef ACCGPU
       !$ACC UPDATE HOST(PGP3B) ASYNC(1)
 #endif
-      CALL GSTATS(432,1)
+      CALL GSTATS(437,1)
     ENDIF
     IF (LUPDATE_HOST) THEN
       CALL GSTATS(428,1)

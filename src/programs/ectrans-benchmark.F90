@@ -27,6 +27,9 @@ use mpl_module
 use yomgstats, only: jpmaxstat, gstats_lstats => lstats
 use yomhook, only : dr_hook_init
 use ectrans_memory, only : allocator
+#if defined(CUDA) || defined(HIP)
+use tpm_stats, only : gstats_label => gstats_label_nvtx
+#endif
 #ifdef _OPENACC
 ! 260419 wrqt begin
 ! 260419 wrqt comment避免在这里直接使用device_mod同步接口，因为在H100/NVHPC的OpenACC链路下，benchmark链接时会落到hipDeviceSynchronize
@@ -218,7 +221,8 @@ endif
 call get_command_line_arguments(nsmax, cgrid, iters, iters_warmup, nfld, nlev, lvordiv, lscders, &
   &                             luvder, luseflt, nopt_mem_tr, nproma, npromatr, verbosity, &
   &                             ldump_values, lprint_norms, lmeminfo, nprtrv, nprtrw, ncheck, &
-  &                             lpinning, icall_mode, ldump_checksums, cchecksums_path)
+  &                             lpinning, icall_mode, ldump_checksums, cchecksums_path, &
+  &                             ldetailed_stats)
 if (cgrid == '') cgrid = cubic_octahedral_gaussian_grid(nsmax)
 call parse_grid(cgrid, ndgl, nloen)
 nflevg = nlev
@@ -1261,6 +1265,7 @@ subroutine print_help(unit)
    & https://sites.ecmwf.int/docs/ectrans/page/api.html for more information (default  = 2)"
   write(nout, "(a)") ""
   write(nout, "(a)") "DEBUGGING"
+  write(nout, "(a)") "    --detailed-stats          Print all GSTATS regions for every MPI task"
   write(nout, "(a)") "    --dump-values             Output gridpoint fields in unformatted binary file"
   write(nout, "(a)") "    --dump-checksums FILENAME Output CRC64 checksums of fields in text file named FILENAME"
   write(nout, "(a)") ""
@@ -1288,7 +1293,7 @@ subroutine get_command_line_arguments(nsmax, cgrid, iters, iters_warmup, nfld, n
   &                                   lscders, luvder, luseflt, nopt_mem_tr, nproma, npromatr, &
   &                                   verbosity, ldump_values, lprint_norms, lmeminfo, nprtrv, &
   &                                   nprtrw, ncheck, lpinning, icall_mode, ldump_checksums, &
-  &                                   cchecksums_path)
+  &                                   cchecksums_path, ldetailed_stats)
 
 #ifdef _OPENACC
   use openacc, only: acc_init, acc_get_device_type
@@ -1310,6 +1315,7 @@ subroutine get_command_line_arguments(nsmax, cgrid, iters, iters_warmup, nfld, n
   integer, intent(inout) :: verbosity       ! Level of verbosity
   logical, intent(inout) :: ldump_values    ! Dump values of grid point fields for debugging
   logical, intent(inout) :: ldump_checksums ! Dump CRC checksums
+  logical, intent(inout) :: ldetailed_stats ! Print all GSTATS regions for every MPI task
   logical, intent(inout) :: lprint_norms    ! Calculate and print spectral norms of fields
   logical, intent(inout) :: lmeminfo        ! Show information from FIAT ec_meminfo routine at the
                                             ! end
@@ -1372,6 +1378,7 @@ subroutine get_command_line_arguments(nsmax, cgrid, iters, iters_warmup, nfld, n
       case('--nproma'); nproma = get_int_value('--nproma', iarg)
       case('--npromatr'); npromatr = get_int_value('--npromatr', iarg)
       case('--dump-values'); ldump_values = .true.
+      case('--detailed-stats'); ldetailed_stats = .true.
       case('--dump-checksums')
         ldump_checksums = .true.
         cchecksums_path = get_str_value('--dump-checksums', iarg)
@@ -1896,38 +1903,49 @@ subroutine gstats_labels
   call gstats_label(158, '   ', 'FTDIR_CTL      - G to L transposition')
   call gstats_label(410, '   ', 'DIR_TRANS      - GPU external total')
   call gstats_label(413, '   ', 'FTDIR          - Execute direct FFT')
-  call gstats_label(414, '   ', 'LEDIR          - Legendre GEMM total')
+  call gstats_label(414, '   ', 'LEDIR          - Legendre GEMM phase')
   call gstats_label(415, '   ', 'LEDIR          - Antisym GEMM')
   call gstats_label(416, '   ', 'LEDIR          - Antisym scatter')
   call gstats_label(417, '   ', 'LEDIR          - Sym GEMM')
   call gstats_label(418, '   ', 'LEDIR          - Sym scatter')
   call gstats_label(420, '   ', 'INV_TRANS      - GPU external total')
   call gstats_label(423, '   ', 'FTINV          - Execute inverse FFT')
-  call gstats_label(424, '   ', 'LEINV          - Legendre GEMM total')
-  call gstats_label(470, '   ', 'LEINV          - Pair pack')
+  call gstats_label(424, '   ', 'LTINV/LEINV    - Legendre GEMM total')
+  call gstats_label(470, '   ', 'LTINV          - Pair pack total')
   call gstats_label(471, '   ', 'LEINV          - Antisym GEMM submit')
-  call gstats_label(472, '   ', 'LEINV          - Sym gather')
   call gstats_label(473, '   ', 'LEINV          - Sym GEMM submit')
-  call gstats_label(474, '   ', 'LEINV          - Input data setup')
-  call gstats_label(475, '   ', 'LEINV          - Close input data')
-  call gstats_label(476, '   ', 'LEINV          - Pair pack spec')
-  call gstats_label(477, '   ', 'LEINV          - Pair pack uv')
+  call gstats_label(474, '   ', 'LTINV          - Input data setup')
+  call gstats_label(475, '   ', 'LTINV          - Close input data')
+  call gstats_label(476, '   ', 'LTINV          - Pair pack spec')
+  call gstats_label(477, '   ', 'LTINV          - Pair pack uv')
   call gstats_label(478, '   ', 'LEINV          - Pair GEMM wait')
-  call gstats_label(479, '   ', 'LEINV          - Pair pack spec+nsder')
-  call gstats_label(421, '   ', 'TRANS          - MPI/update exchange')
-  call gstats_label(422, '   ', 'TRANS          - Finalize/update host')
+  call gstats_label(479, '   ', 'LTINV          - Pair pack spec+nsder')
+  call gstats_label(421, '   ', 'TRANS          - Exchange phase')
+  call gstats_label(422, '   ', 'TRANS          - Finalize phase')
   call gstats_label(425, '   ', 'TRLTOG         - Close data regions')
   call gstats_label(426, '   ', 'TRLTOG         - Update host PGP')
   call gstats_label(427, '   ', 'TRLTOG         - Update host PGPUV')
   call gstats_label(428, '   ', 'TRLTOG         - Update host scalar group')
   call gstats_label(429, '   ', 'TRLTOG         - Delete ACC descriptors')
-  call gstats_label(430, '   ', 'TRLTOG         - Update host PGP2')
-  call gstats_label(431, '   ', 'TRLTOG         - Update host PGP3A')
-  call gstats_label(432, '   ', 'TRLTOG         - Update host PGP3B')
-  call gstats_label(433, '   ', 'TRLTOG         - Update host ZCOMBUFS')
-  call gstats_label(434, '   ', 'TRLTOG         - Update device ZCOMBUFR')
-  call gstats_label(411, '   ', 'TRGTOL         - Remote exchange total')
-  call gstats_label(412, '   ', 'TRGTOL         - Device prepare total')
+  call gstats_label(430, '   ', 'DIR_TRANS      - Barrier')
+  call gstats_label(431, '   ', 'TRLTOM         - Post-MPI barrier')
+  call gstats_label(432, '   ', 'LTDIR          - Final barrier')
+  call gstats_label(433, '   ', 'FTDIR          - Post-FFT barrier')
+  call gstats_label(434, '   ', 'LEDIR          - Post-GEMM barrier')
+  call gstats_label(435, '   ', 'TRLTOG         - Update host PGP2')
+  call gstats_label(436, '   ', 'TRLTOG         - Update host PGP3A')
+  call gstats_label(437, '   ', 'TRLTOG         - Update host PGP3B')
+  call gstats_label(438, '   ', 'TRLTOG         - Update host ZCOMBUFS')
+  call gstats_label(439, '   ', 'TRLTOG         - Update device ZCOMBUFR')
+  call gstats_label(411, '   ', 'TRLTOM         - Remote exchange total')
+  call gstats_label(412, '   ', 'LTDIR          - Device finalize total')
+  call gstats_label(443, '   ', 'FTINV          - Post-FFT barrier')
+  call gstats_label(444, '   ', 'LEINV          - Post-GEMM barrier')
+  call gstats_label(445, '   ', 'TRGTOL         - Remote exchange total')
+  call gstats_label(446, '   ', 'TRGTOL         - Device prepare total')
+  call gstats_label(447, '   ', 'TRLTOG         - Post MPI receives')
+  call gstats_label(448, '   ', 'TRLTOG         - Post MPI sends')
+  call gstats_label(449, '   ', 'TRLTOG         - MPI wait')
   call gstats_label(450, '   ', 'TRGTOL         - Update device total')
   call gstats_label(451, '   ', 'TRGTOL         - Update device PGP')
   call gstats_label(452, '   ', 'TRGTOL         - Update device PGPUV')
@@ -1950,27 +1968,33 @@ subroutine gstats_labels
   call gstats_label(483, '   ', 'TRGTOL         - Assign PREEL/data copyin')
   call gstats_label(484, '   ', 'TRGTOL         - Input device setup')
   call gstats_label(485, '   ', 'TRGTOL         - Remote pack total')
-  call gstats_label(486, '   ', 'TRGTOL         - Pack PGP kernel')
-  call gstats_label(487, '   ', 'TRGTOL         - Pack split arrays kernel')
-  call gstats_label(488, '   ', 'TRGTOL         - Local materialize total')
-  call gstats_label(489, '   ', 'TRGTOL         - Local PGP to PREEL')
-  call gstats_label(490, '   ', 'TRGTOL         - Local split arrays to PREEL')
-  call gstats_label(491, '   ', 'TRGTOL         - Remote unpack to PREEL')
+  call gstats_label(486, '   ', 'TRGTOL         - Pack PGP submit')
+  call gstats_label(487, '   ', 'TRGTOL         - Pack split arrays submit')
+  call gstats_label(488, '   ', 'TRGTOL         - Local materialize submit')
+  call gstats_label(489, '   ', 'TRGTOL         - Local PGP submit')
+  call gstats_label(490, '   ', 'TRGTOL         - Local split arrays submit')
+  call gstats_label(491, '   ', 'TRGTOL         - Unpack and stream drain')
   call gstats_label(492, '   ', 'TRGTOL         - Close data regions')
   call gstats_label(493, '   ', 'TRGTOL         - Delete ACC descriptors')
+  call gstats_label(494, '   ', 'LEINV          - Antisym gather')
+  call gstats_label(495, '   ', 'LEINV          - Sym gather')
   call gstats_label(440, '   ', 'TRANS          - Pre-MPI barrier')
   call gstats_label(441, '   ', 'TRANS          - Post-MPI barrier')
   call gstats_label(442, '   ', 'TRANS          - Final barrier')
+  call gstats_label(466, '   ', 'TRLTOG         - MPI count preparation')
+  call gstats_label(467, '   ', 'TRLTOG         - Local PGP submit')
+  call gstats_label(468, '   ', 'TRLTOG         - Local split submit')
+  call gstats_label(469, '   ', 'TRLTOG         - Local/pack pipeline')
   call gstats_label(805, '   ', 'TRLTOG         - Remote exchange total')
-  call gstats_label(806, '   ', 'TRLTOG         - Post MPI receives')
-  call gstats_label(807, '   ', 'TRLTOG         - Post MPI sends')
-  call gstats_label(808, '   ', 'TRLTOG         - MPI wait')
-  call gstats_label(809, '   ', 'TRLTOG         - MPI count preparation')
-  call gstats_label(1604, '   ', 'TRLTOG         - Local self copy')
-  call gstats_label(1605, '   ', 'TRLTOG         - Pack send buffer')
+  call gstats_label(806, '   ', 'TRLTOM         - Transposition total')
+  call gstats_label(807, '   ', 'TRMTOL         - Transposition total')
+  call gstats_label(808, '   ', 'TRANS          - MPI wait')
+  call gstats_label(809, '   ', 'GATH_GRID      - Communication total')
+  call gstats_label(1604, '   ', 'TRLTOG         - Local self copy submit')
+  call gstats_label(1605, '   ', 'TRLTOG         - Pack send buffer submit')
   call gstats_label(1606, '   ', 'TRLTOG         - Unpack/finalize total')
-  call gstats_label(1607, '   ', 'TRLTOG         - Local copy PGP')
-  call gstats_label(1608, '   ', 'TRLTOG         - Local copy split arrays')
+  call gstats_label(1607, '   ', 'TRLTOM         - Local buffer copy')
+  call gstats_label(1608, '   ', 'TRMTOL         - Local buffer copy')
   call gstats_label(1609, '   ', 'TRLTOG         - Remote unpack kernel')
   call gstats_label(1610, '   ', 'TRLTOG         - Close recv data region')
   call gstats_label(1611, '   ', 'TRLTOG         - Close index data region')
@@ -1978,13 +2002,14 @@ subroutine gstats_labels
   call gstats_label(1602, '   ', 'TRGTOL         - Pack send buffer')
   call gstats_label(1603, '   ', 'TRGTOL         - Unpack recv buffer')
   call gstats_label(1613, '   ', 'TRGTOL         - Build send field map')
-  call gstats_label(1614, '   ', 'TRGTOL         - Copyin send field map')
-  call gstats_label(1615, '   ', 'TRGTOL         - Pack PGP')
-  call gstats_label(1616, '   ', 'TRGTOL         - Pack split arrays')
-  call gstats_label(1617, '   ', 'TRGTOL         - Local copy PGP')
-  call gstats_label(1618, '   ', 'TRGTOL         - Local copy split arrays')
+  call gstats_label(1614, '   ', 'TRGTOL         - Copyin field map submit')
+  call gstats_label(1615, '   ', 'TRGTOL         - Pack PGP submit')
+  call gstats_label(1616, '   ', 'TRGTOL         - Pack split submit')
+  call gstats_label(1617, '   ', 'TRGTOL         - Local PGP submit')
+  call gstats_label(1618, '   ', 'TRGTOL         - Local split submit')
   call gstats_label(1806, '   ', 'TRLTOG         - Setup/index/data region')
-  call gstats_label(1810, '   ', 'TRLTOG         - Build recv counts')
+  call gstats_label(1810, '   ', 'DIR_TRANSAD    - Total')
+  call gstats_label(1818, '   ', 'TRLTOG         - Build recv counts')
   call gstats_label(1811, '   ', 'TRLTOG         - Build send index map')
   call gstats_label(1812, '   ', 'TRLTOG         - Copyin IGP offsets')
   call gstats_label(1813, '   ', 'TRLTOG         - Create ACC descriptors')
