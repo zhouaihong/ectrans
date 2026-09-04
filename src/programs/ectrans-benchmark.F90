@@ -94,6 +94,9 @@ real(kind=jprb), pointer :: zspdiv(:,:)
 real(kind=jprb), pointer :: zspscalar(:,:)
 real(kind=jprb), pointer :: zspsc3a(:,:,:)
 real(kind=jprb), pointer :: zspsc2(:,:)
+real(kind=jprb), allocatable :: zspvor_ref(:,:), zspdiv_ref(:,:)
+real(kind=jprb), allocatable :: zspscalar_ref(:,:), zspsc3a_ref(:,:,:), zspsc2_ref(:,:)
+real(kind=jprd) :: zcoefficient_error
 
 ! Grid-point space data structures
 real(kind=jprb), pointer :: zgp(:,:,:)
@@ -179,6 +182,7 @@ logical :: ldump_values = .false.
 logical :: lpinning = .false.
 logical :: ldump_checksums = .false.
 logical :: lspectral_device_cache = .false.
+logical :: lbroad_spectrum = .false.
 character(len=256) :: checksums_filename
 
 integer, external :: ec_mpirank
@@ -223,6 +227,7 @@ call get_command_line_arguments(nsmax, cgrid, iters, iters_warmup, nfld, nlev, l
   &                             ldump_values, lprint_norms, lmeminfo, nprtrv, nprtrw, ncheck, &
   &                             lpinning, icall_mode, ldump_checksums, cchecksums_path, &
   &                             ldetailed_stats)
+lbroad_spectrum = broad_spectrum_requested()
 if (cgrid == '') cgrid = cubic_octahedral_gaussian_grid(nsmax)
 call parse_grid(cgrid, ndgl, nloen)
 nflevg = nlev
@@ -485,6 +490,17 @@ else
     call initialize_spectral_field(nsmax, zspsc3a(:,:,i))
   enddo
   call initialize_spectral_field(nsmax, zspsc2)
+endif
+
+if (lbroad_spectrum) then
+  allocate(zspvor_ref, source=zspvor)
+  allocate(zspdiv_ref, source=zspdiv)
+  if (icall_mode == 1) then
+    allocate(zspscalar_ref, source=zspscalar)
+  else
+    allocate(zspsc3a_ref, source=zspsc3a)
+    allocate(zspsc2_ref, source=zspsc2)
+  endif
 endif
 
 !===================================================================================================
@@ -823,6 +839,20 @@ endif
 
 ztloop = (timef() - ztloop)/1000.0_jprd
 
+zcoefficient_error = 0.0_jprd
+if (lbroad_spectrum) then
+  call report_coefficient_error_2d('zspvor', zspvor_ref, zspvor, zcoefficient_error)
+  call report_coefficient_error_2d('zspdiv', zspdiv_ref, zspdiv, zcoefficient_error)
+  if (icall_mode == 1) then
+    call report_coefficient_error_2d('zspscalar', zspscalar_ref, zspscalar, zcoefficient_error)
+  else
+    call report_coefficient_error_3d('zspsc3a', zspsc3a_ref, zspsc3a, zcoefficient_error)
+    call report_coefficient_error_2d('zspsc2', zspsc2_ref, zspsc2, zcoefficient_error)
+  endif
+  if (myproc == 1) write(nout,'("broad spectrum coefficient error combined = ",es12.5)') &
+    & zcoefficient_error
+endif
+
 write(nout,'(" ")')
 write(nout,'(a)') '======= End of spectral transforms  ======='
 write(nout,'(" ")')
@@ -880,7 +910,7 @@ if (lprint_norms .or. ncheck > 0) then
     endif
 
     ! maximum error across all fields
-    zmaxerrg = maxval(zmaxerr)
+    zmaxerrg = max(maxval(zmaxerr), zcoefficient_error)
 
     if (verbosity >= 1) write(nout,*)
     write(nout,'("max error zspvor(1:nlev,:)    = ",e10.3)') zmaxerr(1)
@@ -1065,6 +1095,15 @@ if (lmeminfo) then
       & kcall=1)
 endif
 
+if (lbroad_spectrum) then
+  deallocate(zspvor_ref, zspdiv_ref)
+  if (icall_mode == 1) then
+    deallocate(zspscalar_ref)
+  else
+    deallocate(zspsc3a_ref, zspsc2_ref)
+  endif
+endif
+
 call trans_end
 
 ! 260419 wrqt begin
@@ -1103,6 +1142,140 @@ endif
 !===================================================================================================
 
 contains
+
+!===================================================================================================
+
+logical function broad_spectrum_requested()
+
+  character(len=16) :: env_value
+  integer :: ilength, istatus
+
+  call get_environment_variable('ECTRANS_BENCHMARK_BROAD_SPECTRUM', env_value, &
+    & length=ilength, status=istatus)
+  broad_spectrum_requested = istatus == 0 .and. ilength > 0 .and. env_value(1:1) == '1'
+
+end function broad_spectrum_requested
+
+!===================================================================================================
+
+subroutine report_coefficient_error_2d(name, reference, field, combined_error)
+
+  character(len=*), intent(in) :: name
+  real(kind=jprb), intent(in) :: reference(:,:), field(:,:)
+  real(kind=jprd), intent(inout) :: combined_error
+
+  integer, allocatable :: my_zon_wns(:), nasm0(:)
+  integer :: num_my_zon_wns
+  real(kind=jprd) :: error2, reference2, max_error, max_reference
+
+  call spectral_layout(my_zon_wns, nasm0, num_my_zon_wns)
+  error2 = 0.0_jprd
+  reference2 = 0.0_jprd
+  max_error = 0.0_jprd
+  max_reference = 0.0_jprd
+  call accumulate_coefficient_error(reference, field, my_zon_wns, nasm0, &
+    & num_my_zon_wns, error2, reference2, max_error, max_reference)
+  call finish_coefficient_error(name, error2, reference2, max_error, max_reference, combined_error)
+
+end subroutine report_coefficient_error_2d
+
+!===================================================================================================
+
+subroutine report_coefficient_error_3d(name, reference, field, combined_error)
+
+  character(len=*), intent(in) :: name
+  real(kind=jprb), intent(in) :: reference(:,:,:), field(:,:,:)
+  real(kind=jprd), intent(inout) :: combined_error
+
+  integer, allocatable :: my_zon_wns(:), nasm0(:)
+  integer :: ifield, num_my_zon_wns
+  real(kind=jprd) :: error2, reference2, max_error, max_reference
+
+  call spectral_layout(my_zon_wns, nasm0, num_my_zon_wns)
+  error2 = 0.0_jprd
+  reference2 = 0.0_jprd
+  max_error = 0.0_jprd
+  max_reference = 0.0_jprd
+  do ifield = 1, size(field,3)
+    call accumulate_coefficient_error(reference(:,:,ifield), field(:,:,ifield), &
+      & my_zon_wns, nasm0, num_my_zon_wns, error2, reference2, max_error, max_reference)
+  enddo
+  call finish_coefficient_error(name, error2, reference2, max_error, max_reference, combined_error)
+
+end subroutine report_coefficient_error_3d
+
+!===================================================================================================
+
+subroutine spectral_layout(my_zon_wns, nasm0, num_my_zon_wns)
+
+  integer, allocatable, intent(out) :: my_zon_wns(:), nasm0(:)
+  integer, intent(out) :: num_my_zon_wns
+
+  call trans_inq(knump=num_my_zon_wns)
+  allocate(my_zon_wns(num_my_zon_wns), nasm0(0:nsmax))
+  call trans_inq(kmyms=my_zon_wns, kasm0=nasm0)
+
+end subroutine spectral_layout
+
+!===================================================================================================
+
+subroutine accumulate_coefficient_error(reference, field, my_zon_wns, nasm0, &
+  & num_my_zon_wns, error2, reference2, max_error, max_reference)
+
+  real(kind=jprb), intent(in) :: reference(:,:), field(:,:)
+  integer, intent(in) :: my_zon_wns(:), nasm0(0:), num_my_zon_wns
+  real(kind=jprd), intent(inout) :: error2, reference2, max_error, max_reference
+
+  integer :: icoeff, ifield, im, n
+  real(kind=jprd) :: difference, value
+
+  do im = 1, num_my_zon_wns
+    do n = my_zon_wns(im), nsmax
+      icoeff = nasm0(my_zon_wns(im)) + 2 * (n - my_zon_wns(im)) + 1
+      do ifield = 1, size(field,1)
+        value = real(reference(ifield,icoeff), jprd)
+        difference = real(field(ifield,icoeff), jprd) - value
+        reference2 = reference2 + value * value
+        error2 = error2 + difference * difference
+        max_reference = max(max_reference, abs(value))
+        max_error = max(max_error, abs(difference))
+
+        value = real(reference(ifield,icoeff+1), jprd)
+        difference = real(field(ifield,icoeff+1), jprd) - value
+        reference2 = reference2 + value * value
+        error2 = error2 + difference * difference
+        max_reference = max(max_reference, abs(value))
+        max_error = max(max_error, abs(difference))
+      enddo
+    enddo
+  enddo
+
+end subroutine accumulate_coefficient_error
+
+!===================================================================================================
+
+subroutine finish_coefficient_error(name, error2, reference2, max_error, max_reference, combined_error)
+
+  character(len=*), intent(in) :: name
+  real(kind=jprd), intent(inout) :: error2, reference2, max_error, max_reference
+  real(kind=jprd), intent(inout) :: combined_error
+
+  real(kind=jprd) :: relative_l2, relative_linf
+
+  if (luse_mpi) then
+    call mpl_allreduce(error2, 'sum', ldreprod=.false.)
+    call mpl_allreduce(reference2, 'sum', ldreprod=.false.)
+    call mpl_allreduce(max_error, 'max', ldreprod=.false.)
+    call mpl_allreduce(max_reference, 'max', ldreprod=.false.)
+  endif
+  relative_l2 = sqrt(error2 / max(reference2, tiny(reference2)))
+  relative_linf = max_error / max(max_reference, tiny(max_reference))
+  combined_error = max(combined_error, relative_l2, relative_linf)
+  if (myproc == 1) write(nout,'("broad spectrum coefficient error ",a,&
+    & ": relative_l2=",es12.5," relative_linf=",es12.5," max_abs=",es12.5)') &
+    & trim(name), relative_l2, relative_linf, max_error
+
+end subroutine finish_coefficient_error
 
 !===================================================================================================
 
