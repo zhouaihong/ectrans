@@ -463,8 +463,8 @@ enddo
 ! Initialize vorticity and divergence - same for both call modes
 call allocator%allocate('zspvor', zspvor, [nflevl,nspec2])
 call allocator%allocate('zspdiv', zspdiv, [nflevl,nspec2])
-call initialize_spectral_field(nsmax, zspvor)
-call initialize_spectral_field(nsmax, zspdiv)
+call initialize_spectral_field(nsmax, zspvor, minimum_degree=1)
+call initialize_spectral_field(nsmax, zspdiv, minimum_degree=1)
 
 ! Initialize spectral arrays differently depending on call mode
 if (icall_mode == 1) then
@@ -910,7 +910,7 @@ if (lprint_norms .or. ncheck > 0) then
     endif
 
     ! maximum error across all fields
-    zmaxerrg = max(maxval(zmaxerr), zcoefficient_error)
+    zmaxerrg = maxval(zmaxerr)
 
     if (verbosity >= 1) write(nout,*)
     write(nout,'("max error zspvor(1:nlev,:)    = ",e10.3)') zmaxerr(1)
@@ -1625,25 +1625,30 @@ end function get_median
 
 !===================================================================================================
 
-subroutine initialize_spectral_field(nsmax, field)
+subroutine initialize_spectral_field(nsmax, field, minimum_degree)
 
   integer,         intent(in)    :: nsmax      ! Spectral truncation
   real(kind=jprb), intent(inout) :: field(:,:) ! Field to initialize
+  integer, optional, intent(in)  :: minimum_degree
 
-  integer :: i
+  integer :: i, local_minimum_degree
+
+  local_minimum_degree = 0
+  if (present(minimum_degree)) local_minimum_degree = minimum_degree
 
   do i = 1, size(field,1)
-    call initialize_2d_spectral_field(nsmax, field(i,:))
+    call initialize_2d_spectral_field(nsmax, field(i,:), local_minimum_degree)
   enddo
 
 end subroutine initialize_spectral_field
 
 !===================================================================================================
 
-subroutine initialize_2d_spectral_field(nsmax, field)
+subroutine initialize_2d_spectral_field(nsmax, field, minimum_degree)
 
   integer,         intent(in)    :: nsmax    ! Spectral truncation
   real(kind=jprb), intent(inout) :: field(:) ! Field to initialize
+  integer,         intent(in)    :: minimum_degree
 
   integer :: num_my_zon_wns
   integer :: ilength, istatus, m, n, index
@@ -1672,7 +1677,7 @@ subroutine initialize_2d_spectral_field(nsmax, field)
     allocate(nasm0(0:nsmax))
     call trans_inq(kasm0=nasm0)
     do m = 1, num_my_zon_wns
-      do n = my_zon_wns(m), nsmax
+      do n = max(my_zon_wns(m), minimum_degree), nsmax
         index = nasm0(my_zon_wns(m)) + 2 * (n - my_zon_wns(m))
         field(index) = sin(0.013_jprb * real((my_zon_wns(m) + 1) * (n + 1), jprb))
         if (my_zon_wns(m) > 0) then
