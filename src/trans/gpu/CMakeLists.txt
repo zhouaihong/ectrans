@@ -34,6 +34,7 @@ elseif( HAVE_CUDA )
   list( APPEND trans_gpu_common_src
     algor/hicblas_gemm.cuda.cu
     algor/hicfft.cuda.cu
+    algor/butterfly_projection.cuda.cu
     algor/legendre_recurrence.cuda.cu
   )
   ecbuild_info("warn: IN_PLACE_FFT defined for cuFFT")
