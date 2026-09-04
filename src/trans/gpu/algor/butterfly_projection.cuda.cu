@@ -102,7 +102,14 @@ __global__ void butterfly_projection_reverse_kernel(
       (src[group] + add_dst + pivots[pivot_base + column]) *
           leading_dimension +
       field;
-  *target = beta == 0.0 ? value : value + beta * *target;
+  if (beta == 0.0) {
+    *target = value;
+  } else if (beta == 1.0) {
+    // Level-zero column blocks can contribute to the same output row.
+    atomicAdd(target, value);
+  } else {
+    *target = value + beta * *target;
+  }
 }
 
 } // namespace
