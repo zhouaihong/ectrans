@@ -1231,7 +1231,7 @@ subroutine accumulate_coefficient_error(reference, field, my_zon_wns, nasm0, &
 
   do im = 1, num_my_zon_wns
     do n = my_zon_wns(im), nsmax
-      icoeff = nasm0(my_zon_wns(im)) + 2 * (n - my_zon_wns(im)) + 1
+      icoeff = nasm0(my_zon_wns(im)) + 2 * (n - my_zon_wns(im))
       do ifield = 1, size(field,1)
         value = real(reference(ifield,icoeff), jprd)
         difference = real(field(ifield,icoeff), jprd) - value
@@ -1240,12 +1240,14 @@ subroutine accumulate_coefficient_error(reference, field, my_zon_wns, nasm0, &
         max_reference = max(max_reference, abs(value))
         max_error = max(max_error, abs(difference))
 
-        value = real(reference(ifield,icoeff+1), jprd)
-        difference = real(field(ifield,icoeff+1), jprd) - value
-        reference2 = reference2 + value * value
-        error2 = error2 + difference * difference
-        max_reference = max(max_reference, abs(value))
-        max_error = max(max_error, abs(difference))
+        if (my_zon_wns(im) > 0) then
+          value = real(reference(ifield,icoeff+1), jprd)
+          difference = real(field(ifield,icoeff+1), jprd) - value
+          reference2 = reference2 + value * value
+          error2 = error2 + difference * difference
+          max_reference = max(max_reference, abs(value))
+          max_error = max(max_error, abs(difference))
+        endif
       enddo
     enddo
   enddo
@@ -1671,7 +1673,7 @@ subroutine initialize_2d_spectral_field(nsmax, field)
     call trans_inq(kasm0=nasm0)
     do m = 1, num_my_zon_wns
       do n = my_zon_wns(m), nsmax
-        index = nasm0(my_zon_wns(m)) + 2 * (n - my_zon_wns(m)) + 1
+        index = nasm0(my_zon_wns(m)) + 2 * (n - my_zon_wns(m))
         field(index) = sin(0.013_jprb * real((my_zon_wns(m) + 1) * (n + 1), jprb))
         if (my_zon_wns(m) > 0) then
           field(index + 1) = cos(0.017_jprb * real((my_zon_wns(m) + 1) * (n + 1), jprb))
