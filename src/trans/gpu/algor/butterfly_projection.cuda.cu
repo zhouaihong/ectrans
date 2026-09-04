@@ -82,7 +82,7 @@ __global__ void butterfly_projection_reverse_kernel(
   double value;
   if (column < rank) {
     value =
-        input[(src[group] + add_src + column) * leading_dimension + field];
+        input[(dst[group] + add_src + column) * leading_dimension + field];
   } else {
     value = 0.0;
     for (int row = 0; row < rank; ++row) {
@@ -90,7 +90,7 @@ __global__ void butterfly_projection_reverse_kernel(
           factors[factor_base + static_cast<std::int64_t>(column - rank) *
                                     rank +
                   row];
-      value = fma(input[(src[group] + add_src + row) * leading_dimension +
+      value = fma(input[(dst[group] + add_src + row) * leading_dimension +
                         field],
                   factor, value);
     }
@@ -99,7 +99,7 @@ __global__ void butterfly_projection_reverse_kernel(
   const std::int64_t pivot_base = pivot_offsets[group];
   double *target =
       output +
-      (dst[group] + add_dst + pivots[pivot_base + column]) *
+      (src[group] + add_dst + pivots[pivot_base + column]) *
           leading_dimension +
       field;
   *target = beta == 0.0 ? value : value + beta * *target;
