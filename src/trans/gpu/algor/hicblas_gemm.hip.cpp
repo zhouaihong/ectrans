@@ -75,6 +75,14 @@ bool cutlass_grouped_dp_enabled() {
   return enabled;
 }
 
+bool cutlass_host_schedule_enabled() {
+  static const bool enabled = [] {
+    const char *value = std::getenv("ECTRANS_GPU_CUTLASS_HOST_SCHEDULE");
+    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+  }();
+  return enabled;
+}
+
 bool cutlass_ordered_dp_enabled() {
   static const bool enabled = [] {
     const char *value = std::getenv("ECTRANS_GPU_CUTLASS_ORDERED_DP");
@@ -1012,7 +1020,7 @@ void hipblas_dgemm_wrapper_grouped(int resol_id, int blas_id, char transa,
     cutlass_dgemm_wrapper_grouped_true(
         resol_id, blas_id, op_t1, op_t2, m, n, k, alpha, A, lda, offsetsA, B,
         ldb, offsetsB, beta, C, ldc, offsetsC, batchCount, stream,
-        growing_allocator, synchronize);
+        growing_allocator, synchronize, cutlass_host_schedule_enabled());
     return;
   }
 #endif
@@ -1245,6 +1253,18 @@ void clean_gemm(int resol_id) {
       detail::cutlass_dgemm_grouped_entry<CUBLAS_OP_T, CUBLAS_OP_N>>(resol_id);
   erase_cutlass_dgemm_grouped_cache<
       detail::cutlass_dgemm_grouped_entry<CUBLAS_OP_N, CUBLAS_OP_N>>(resol_id);
+  erase_cutlass_dgemm_grouped_cache<detail::cutlass_dgemm_grouped_entry<
+      CUBLAS_OP_T, CUBLAS_OP_T,
+      cutlass::gemm::kernel::GroupScheduleMode::kHostPrecompute>>(resol_id);
+  erase_cutlass_dgemm_grouped_cache<detail::cutlass_dgemm_grouped_entry<
+      CUBLAS_OP_N, CUBLAS_OP_T,
+      cutlass::gemm::kernel::GroupScheduleMode::kHostPrecompute>>(resol_id);
+  erase_cutlass_dgemm_grouped_cache<detail::cutlass_dgemm_grouped_entry<
+      CUBLAS_OP_T, CUBLAS_OP_N,
+      cutlass::gemm::kernel::GroupScheduleMode::kHostPrecompute>>(resol_id);
+  erase_cutlass_dgemm_grouped_cache<detail::cutlass_dgemm_grouped_entry<
+      CUBLAS_OP_N, CUBLAS_OP_N,
+      cutlass::gemm::kernel::GroupScheduleMode::kHostPrecompute>>(resol_id);
   erase_cutlass_dgemm_grouped_cache<
       detail::cutlass_dgemm_grouped_ordered_entry<CUBLAS_OP_T, CUBLAS_OP_T>>(
       resol_id);

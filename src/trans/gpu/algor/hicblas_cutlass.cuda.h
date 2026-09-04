@@ -272,7 +272,10 @@ private:
   int device_ = 0;
 };
 
-template <cublasOperation_t TransA, cublasOperation_t TransB>
+template <
+    cublasOperation_t TransA, cublasOperation_t TransB,
+    cutlass::gemm::kernel::GroupScheduleMode ScheduleMode =
+        cutlass::gemm::kernel::GroupScheduleMode::kDeviceOnly>
 class cutlass_dgemm_grouped_entry {
   using LayoutA =
       std::conditional_t<TransA == CUBLAS_OP_N, cutlass::layout::ColumnMajor,
@@ -293,7 +296,7 @@ class cutlass_dgemm_grouped_entry {
                                                         double>,
           cutlass::gemm::threadblock::
               GemmBatchedIdentityThreadblockSwizzle,
-          4, cutlass::gemm::kernel::GroupScheduleMode::kDeviceOnly>::GemmKernel;
+          4, ScheduleMode>::GemmKernel;
   using Gemm = cutlass::gemm::device::GemmGrouped<GemmKernel>;
 
 public:
@@ -355,7 +358,8 @@ public:
         ptr_a_.get(), ptr_b_.get(), ptr_c_.get(), ptr_c_.get(), lda_.get(),
         ldb_.get(), ldc_.get(), ldc_.get(), host_problem_sizes_.data());
     CUTLASS_CHECK(Gemm::can_implement(arguments));
-    CUTLASS_CHECK(gemm_.initialize(arguments, nullptr, stream));
+    workspace_.allocate(Gemm::get_workspace_size(arguments));
+    CUTLASS_CHECK(gemm_.initialize(arguments, workspace_.get(), stream));
   }
 
   int problem_count() const { return problem_count_; }
@@ -385,6 +389,7 @@ private:
   cutlass_device_array<int64_t> lda_;
   cutlass_device_array<int64_t> ldb_;
   cutlass_device_array<int64_t> ldc_;
+  cutlass_device_array<uint8_t> workspace_;
   Gemm gemm_;
   int problem_count_ = 0;
   int threadblock_count_ = 0;
@@ -752,14 +757,18 @@ void erase_cutlass_dgemm_grouped_cache(int resol_id) {
   erase_resol_from_cache(state.entries, resol_id);
 }
 
-template <cublasOperation_t TransA, cublasOperation_t TransB>
+template <
+    cublasOperation_t TransA, cublasOperation_t TransB,
+    cutlass::gemm::kernel::GroupScheduleMode ScheduleMode =
+        cutlass::gemm::kernel::GroupScheduleMode::kDeviceOnly>
 void cutlass_dgemm_wrapper_grouped_op(
     int resol_id, int blas_id, int m, const int *n, const int *k, double alpha,
     const double *A, int lda, const int64_t *offsetsA, const double *B,
     const int *ldb, const int64_t *offsetsB, double beta, double *C, int ldc,
     const int64_t *offsetsC, int batchCount, hipStream_t stream,
     void *growing_allocator, bool synchronize) {
-  using Entry = detail::cutlass_dgemm_grouped_entry<TransA, TransB>;
+  using Entry =
+      detail::cutlass_dgemm_grouped_entry<TransA, TransB, ScheduleMode>;
   const auto key = make_cache_key(
       resol_id, blas_id, static_cast<int>(TransA), static_cast<int>(TransB), m,
       n, k, alpha, A, lda, offsetsA, B, ldb, offsetsB, beta, C, ldc, offsetsC,
@@ -792,9 +801,13 @@ void cutlass_dgemm_wrapper_grouped_op(
   if (graph_debug_enabled()) {
     std::fprintf(stderr,
                  "EC_CUTLASS_GROUPED_DP event=run rank=%s resol=%d blas=%d "
-                 "m=%d groups=%d threadblocks=%d cache=%s\n",
+                 "m=%d groups=%d threadblocks=%d schedule=%s cache=%s\n",
                  graph_debug_rank(), resol_id, blas_id, m,
                  entry->problem_count(), entry->threadblock_count(),
+                 ScheduleMode == cutlass::gemm::kernel::GroupScheduleMode::
+                                     kHostPrecompute
+                     ? "host"
+                     : "device",
                  cache_miss ? "miss" : "hit");
     std::fflush(stderr);
   }
@@ -803,7 +816,8 @@ void cutlass_dgemm_wrapper_grouped_op(
     HIC_CHECK(hipStreamSynchronize(stream));
 }
 
-void cutlass_dgemm_wrapper_grouped_true(
+template <cutlass::gemm::kernel::GroupScheduleMode ScheduleMode>
+void cutlass_dgemm_wrapper_grouped_true_mode(
     int resol_id, int blas_id, cublasOperation_t transa,
     cublasOperation_t transb, int m, const int *n, const int *k, double alpha,
     const double *A, int lda, const int64_t *offsetsA, const double *B,
@@ -811,27 +825,48 @@ void cutlass_dgemm_wrapper_grouped_true(
     const int64_t *offsetsC, int batchCount, hipStream_t stream,
     void *growing_allocator, bool synchronize) {
   if (transa == CUBLAS_OP_N && transb == CUBLAS_OP_N)
-    cutlass_dgemm_wrapper_grouped_op<CUBLAS_OP_N, CUBLAS_OP_N>(
+    cutlass_dgemm_wrapper_grouped_op<CUBLAS_OP_N, CUBLAS_OP_N, ScheduleMode>(
         resol_id, blas_id, m, n, k, alpha, A, lda, offsetsA, B, ldb, offsetsB,
         beta, C, ldc, offsetsC, batchCount, stream, growing_allocator,
         synchronize);
   else if (transa == CUBLAS_OP_N && transb == CUBLAS_OP_T)
-    cutlass_dgemm_wrapper_grouped_op<CUBLAS_OP_N, CUBLAS_OP_T>(
+    cutlass_dgemm_wrapper_grouped_op<CUBLAS_OP_N, CUBLAS_OP_T, ScheduleMode>(
         resol_id, blas_id, m, n, k, alpha, A, lda, offsetsA, B, ldb, offsetsB,
         beta, C, ldc, offsetsC, batchCount, stream, growing_allocator,
         synchronize);
   else if (transa == CUBLAS_OP_T && transb == CUBLAS_OP_N)
-    cutlass_dgemm_wrapper_grouped_op<CUBLAS_OP_T, CUBLAS_OP_N>(
+    cutlass_dgemm_wrapper_grouped_op<CUBLAS_OP_T, CUBLAS_OP_N, ScheduleMode>(
         resol_id, blas_id, m, n, k, alpha, A, lda, offsetsA, B, ldb, offsetsB,
         beta, C, ldc, offsetsC, batchCount, stream, growing_allocator,
         synchronize);
   else if (transa == CUBLAS_OP_T && transb == CUBLAS_OP_T)
-    cutlass_dgemm_wrapper_grouped_op<CUBLAS_OP_T, CUBLAS_OP_T>(
+    cutlass_dgemm_wrapper_grouped_op<CUBLAS_OP_T, CUBLAS_OP_T, ScheduleMode>(
         resol_id, blas_id, m, n, k, alpha, A, lda, offsetsA, B, ldb, offsetsB,
         beta, C, ldc, offsetsC, batchCount, stream, growing_allocator,
         synchronize);
   else
     assert(false);
+}
+
+void cutlass_dgemm_wrapper_grouped_true(
+    int resol_id, int blas_id, cublasOperation_t transa,
+    cublasOperation_t transb, int m, const int *n, const int *k, double alpha,
+    const double *A, int lda, const int64_t *offsetsA, const double *B,
+    const int *ldb, const int64_t *offsetsB, double beta, double *C, int ldc,
+    const int64_t *offsetsC, int batchCount, hipStream_t stream,
+    void *growing_allocator, bool synchronize, bool host_schedule) {
+  if (host_schedule)
+    cutlass_dgemm_wrapper_grouped_true_mode<
+        cutlass::gemm::kernel::GroupScheduleMode::kHostPrecompute>(
+        resol_id, blas_id, transa, transb, m, n, k, alpha, A, lda, offsetsA, B,
+        ldb, offsetsB, beta, C, ldc, offsetsC, batchCount, stream,
+        growing_allocator, synchronize);
+  else
+    cutlass_dgemm_wrapper_grouped_true_mode<
+        cutlass::gemm::kernel::GroupScheduleMode::kDeviceOnly>(
+        resol_id, blas_id, transa, transb, m, n, k, alpha, A, lda, offsetsA, B,
+        ldb, offsetsB, beta, C, ldc, offsetsC, batchCount, stream,
+        growing_allocator, synchronize);
 }
 
 template <cublasOperation_t TransA, cublasOperation_t TransB>
