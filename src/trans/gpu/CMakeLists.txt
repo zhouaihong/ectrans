@@ -130,6 +130,7 @@ function(generate_backend_sources)
   else()
     ecbuild_list_exclude_pattern( LIST files REGEX
             internal/butterfly_gpu_mod.F90
+            internal/legendre_recurrence_gpu_mod.F90
     )
   endif()
   ecbuild_list_exclude_pattern( LIST files REGEX
