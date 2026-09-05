@@ -22,7 +22,7 @@ __global__ void butterfly_grouped_gemm_kernel(
     const std::int64_t *__restrict__ dst,
     const std::int64_t *__restrict__ factor_offsets, std::int64_t add_src,
     std::int64_t add_dst, int group_base, int factor_transposed,
-    double beta) {
+    int atomic_output, double beta) {
   __shared__ double tile_a[gemm_tile][gemm_tile + 1];
   __shared__ double tile_b[gemm_tile][gemm_tile + 1];
 
@@ -64,7 +64,11 @@ __global__ void butterfly_grouped_gemm_kernel(
   if (field < leading_dimension && column < n) {
     double *target =
         output + (dst[group] + add_dst + column) * leading_dimension + field;
-    *target = beta == 0.0 ? value : value + beta * *target;
+    if (atomic_output) {
+      atomicAdd(target, value);
+    } else {
+      *target = beta == 0.0 ? value : value + beta * *target;
+    }
   }
 }
 
@@ -190,7 +194,8 @@ extern "C" void ectrans_butterfly_grouped_gemm_cuda(
     const int *factor_ld, const std::int64_t *src, const std::int64_t *dst,
     const std::int64_t *factor_offsets, std::int64_t add_src,
     std::int64_t add_dst, int group_count, int max_outputs,
-    int factor_transposed, double beta, std::intptr_t stream_value) {
+    int factor_transposed, int atomic_output, double beta,
+    std::intptr_t stream_value) {
   if (leading_dimension <= 0 || group_count <= 0 || max_outputs <= 0)
     return;
 
@@ -210,7 +215,7 @@ extern "C" void ectrans_butterfly_grouped_gemm_cuda(
     butterfly_grouped_gemm_kernel<<<grid, block, 0, stream>>>(
         input, factors, output, leading_dimension, outputs, inner, factor_ld,
         src, dst, factor_offsets, add_src, add_dst, group_base,
-        factor_transposed, beta);
+        factor_transposed, atomic_output, beta);
   }
   const cudaError_t error = cudaGetLastError();
   if (error != cudaSuccess) {
