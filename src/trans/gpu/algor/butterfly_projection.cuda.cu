@@ -5,6 +5,7 @@
 #include <cuda_runtime.h>
 #include <mma.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
@@ -19,6 +20,7 @@ constexpr int warp_threads = 32;
 constexpr int wmma_field_tile = 64;
 constexpr int wmma_warps_per_block = 16;
 constexpr int warp_small_warps_per_block = 8;
+constexpr int fused_leaf_field_tile = 8;
 
 bool warp_small_requested() {
   const char *value = std::getenv("ECTRANS_GPU_BUTTERFLY_WARP_SMALL");
@@ -508,6 +510,72 @@ __global__ void butterfly_projection_reverse_kernel(
   }
 }
 
+__global__ void butterfly_fused_leaf_direct_kernel(
+    const double *__restrict__ input, const double *__restrict__ factors,
+    double *__restrict__ output, int leading_dimension,
+    const int *__restrict__ rows, const int *__restrict__ ranks,
+    const int *__restrict__ columns,
+    const std::int64_t *__restrict__ input_columns,
+    const std::int64_t *__restrict__ output_columns,
+    const std::int64_t *__restrict__ final_factor_offsets,
+    const std::int64_t *__restrict__ projection_factor_offsets,
+    const std::int64_t *__restrict__ pivot_offsets,
+    const int *__restrict__ pivots) {
+  extern __shared__ double beta[];
+  const int group = static_cast<int>(blockIdx.x);
+  const int field_base =
+      static_cast<int>(blockIdx.y) * fused_leaf_field_tile;
+  const int row_count = rows[group];
+  const int rank = ranks[group];
+  const int column_count = columns[group];
+  const std::int64_t input_column = input_columns[group];
+  const std::int64_t output_column = output_columns[group];
+  const std::int64_t final_offset = final_factor_offsets[group];
+  const std::int64_t projection_offset =
+      projection_factor_offsets[group];
+  const std::int64_t pivot_offset = pivot_offsets[group];
+
+  for (int index = threadIdx.x; index < rank * fused_leaf_field_tile;
+       index += blockDim.x) {
+    const int field_lane = index % fused_leaf_field_tile;
+    const int rank_index = index / fused_leaf_field_tile;
+    const int field = field_base + field_lane;
+    double value = 0.0;
+    if (field < leading_dimension) {
+      value = input[(input_column + pivots[pivot_offset + rank_index]) *
+                        leading_dimension +
+                    field];
+      for (int column = rank; column < column_count; ++column) {
+        value += input[(input_column + pivots[pivot_offset + column]) *
+                           leading_dimension +
+                       field] *
+                 factors[projection_offset + rank_index +
+                         static_cast<std::int64_t>(column - rank) * rank];
+      }
+    }
+    beta[index] = value;
+  }
+  __syncthreads();
+
+  for (int index = threadIdx.x; index < row_count * fused_leaf_field_tile;
+       index += blockDim.x) {
+    const int field_lane = index % fused_leaf_field_tile;
+    const int row = index / fused_leaf_field_tile;
+    const int field = field_base + field_lane;
+    if (field >= leading_dimension)
+      continue;
+    double value = 0.0;
+    for (int rank_index = 0; rank_index < rank; ++rank_index) {
+      value += beta[rank_index * fused_leaf_field_tile + field_lane] *
+               factors[final_offset + row +
+                       static_cast<std::int64_t>(rank_index) * row_count];
+    }
+    atomicAdd(output +
+                  (output_column + row) * leading_dimension + field,
+              value);
+  }
+}
+
 } // namespace
 
 extern "C" void ectrans_butterfly_projection_cuda(
@@ -582,6 +650,38 @@ extern "C" void ectrans_butterfly_compact_projection_cuda(
   if (error != cudaSuccess) {
     std::fprintf(stderr,
                  "butterfly compact projection CUDA launch failed: %s\n",
+                 cudaGetErrorString(error));
+    std::exit(EXIT_FAILURE);
+  }
+}
+
+extern "C" void ectrans_butterfly_fused_leaf_direct_cuda(
+    const double *input, const double *factors, double *output,
+    int leading_dimension, const int *rows, const int *ranks,
+    const int *columns, const std::int64_t *input_columns,
+    const std::int64_t *output_columns,
+    const std::int64_t *final_factor_offsets,
+    const std::int64_t *projection_factor_offsets,
+    const std::int64_t *pivot_offsets, const int *pivots, int group_count,
+    int max_rank, std::intptr_t stream_value) {
+  if (leading_dimension <= 0 || group_count <= 0 || max_rank <= 0)
+    return;
+  const dim3 block(256);
+  const dim3 grid(static_cast<unsigned int>(group_count),
+                  static_cast<unsigned int>((leading_dimension +
+                                             fused_leaf_field_tile - 1) /
+                                            fused_leaf_field_tile));
+  const std::size_t shared_bytes =
+      static_cast<std::size_t>(max_rank) * fused_leaf_field_tile *
+      sizeof(double);
+  const auto stream = reinterpret_cast<cudaStream_t>(stream_value);
+  butterfly_fused_leaf_direct_kernel<<<grid, block, shared_bytes, stream>>>(
+      input, factors, output, leading_dimension, rows, ranks, columns,
+      input_columns, output_columns, final_factor_offsets,
+      projection_factor_offsets, pivot_offsets, pivots);
+  const cudaError_t error = cudaGetLastError();
+  if (error != cudaSuccess) {
+    std::fprintf(stderr, "butterfly fused leaf CUDA launch failed: %s\n",
                  cudaGetErrorString(error));
     std::exit(EXIT_FAILURE);
   }
