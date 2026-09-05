@@ -112,6 +112,100 @@ __global__ void butterfly_grouped_gemm_kernel(
   }
 }
 
+__global__ void butterfly_compact_projection_kernel(
+    const double *__restrict__ input, const double *__restrict__ factors,
+    double *__restrict__ output, int leading_dimension,
+    const int *__restrict__ ranks, const int *__restrict__ columns,
+    const std::int64_t *__restrict__ src,
+    const std::int64_t *__restrict__ dst,
+    const std::int64_t *__restrict__ pivot_offsets,
+    const std::int64_t *__restrict__ factor_offsets,
+    const int *__restrict__ pivots, std::int64_t add_src,
+    std::int64_t add_dst, int group_base, double beta) {
+  __shared__ __align__(32) double tile_a[gemm_tile * 4];
+  __shared__ __align__(32) double tile_b[4 * gemm_tile];
+  __shared__ __align__(32) double tile_c[gemm_tile * gemm_tile];
+
+  const int group = group_base + static_cast<int>(blockIdx.z);
+  const int thread = threadIdx.x;
+  const int field_base = static_cast<int>(blockIdx.x) * gemm_tile;
+  const int column_base = static_cast<int>(blockIdx.y) * gemm_tile;
+  const int n = ranks[group];
+  const int k = columns[group] - n;
+  if (column_base >= n)
+    return;
+
+  const int warp = thread / warp_threads;
+  const int warp_row = (warp & 1) * 8;
+  const int warp_column = (warp >> 1) * 8;
+  nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 8, 8, 4, double,
+                         nvcuda::wmma::col_major>
+      a_fragment;
+  nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 8, 8, 4, double,
+                         nvcuda::wmma::col_major>
+      b_fragment;
+  nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 8, 8, 4, double>
+      accumulator;
+  nvcuda::wmma::fill_fragment(accumulator, 0.0);
+
+  const std::int64_t pivot_offset = pivot_offsets[group];
+  const std::int64_t factor_offset = factor_offsets[group];
+  for (int k_base = 0; k_base < k; k_base += 4) {
+    if (thread < gemm_tile * 4) {
+      const int row = thread % gemm_tile;
+      const int local_k = thread / gemm_tile;
+      const int field = field_base + row;
+      const int global_k = k_base + local_k;
+      tile_a[thread] =
+          field < leading_dimension && global_k < k
+              ? input[(src[group] + add_src +
+                       pivots[pivot_offset + n + global_k]) *
+                          leading_dimension +
+                      field]
+              : 0.0;
+
+      const int b_k = thread % 4;
+      const int local_column = thread / 4;
+      const int column = column_base + local_column;
+      tile_b[thread] =
+          k_base + b_k < k && column < n
+              ? factors[factor_offset + column +
+                        static_cast<std::int64_t>(k_base + b_k) * n]
+              : 0.0;
+    }
+    __syncthreads();
+
+    nvcuda::wmma::load_matrix_sync(a_fragment, tile_a + warp_row, gemm_tile);
+    nvcuda::wmma::load_matrix_sync(b_fragment,
+                                   tile_b + warp_column * 4, 4);
+    nvcuda::wmma::mma_sync(accumulator, a_fragment, b_fragment, accumulator);
+    __syncthreads();
+  }
+
+  nvcuda::wmma::store_matrix_sync(
+      tile_c + warp_row + warp_column * gemm_tile, accumulator, gemm_tile,
+      nvcuda::wmma::mem_col_major);
+  __syncthreads();
+
+  for (int index = thread; index < gemm_tile * gemm_tile;
+       index += blockDim.x) {
+    const int row = index % gemm_tile;
+    const int local_column = index / gemm_tile;
+    const int field = field_base + row;
+    const int column = column_base + local_column;
+    if (field < leading_dimension && column < n) {
+      const double pivot =
+          input[(src[group] + add_src + pivots[pivot_offset + column]) *
+                    leading_dimension +
+                field];
+      double *target =
+          output + (dst[group] + add_dst + column) * leading_dimension + field;
+      const double value = pivot + tile_c[index];
+      *target = beta == 0.0 ? value : value + beta * *target;
+    }
+  }
+}
+
 void launch_grouped_gemm(
     const double *input, const double *factors, double *output,
     int leading_dimension, const int *outputs, const int *inner,
@@ -140,6 +234,37 @@ void launch_grouped_gemm(
         input, factors, output, leading_dimension, outputs, inner, factor_ld,
         src, dst, factor_offsets, add_src, add_dst, group_base,
         factor_transposed, atomic_output, compact_projection, beta);
+  }
+}
+
+void launch_compact_projection(
+    const double *input, const double *factors, double *output,
+    int leading_dimension, const int *ranks, const int *columns,
+    const std::int64_t *src, const std::int64_t *dst,
+    const std::int64_t *pivot_offsets,
+    const std::int64_t *factor_offsets, const int *pivots,
+    std::int64_t add_src, std::int64_t add_dst, int group_count,
+    int max_rank, double beta, std::intptr_t stream_value) {
+  if (leading_dimension <= 0 || group_count <= 0 || max_rank <= 0)
+    return;
+
+  const dim3 block(4 * warp_threads);
+  const auto stream = reinterpret_cast<cudaStream_t>(stream_value);
+  constexpr int max_grid_z = 65535;
+  for (int group_base = 0; group_base < group_count;
+       group_base += max_grid_z) {
+    const int groups =
+        group_count - group_base < max_grid_z ? group_count - group_base
+                                               : max_grid_z;
+    const dim3 grid(
+        static_cast<unsigned int>((leading_dimension + gemm_tile - 1) /
+                                  gemm_tile),
+        static_cast<unsigned int>((max_rank + gemm_tile - 1) / gemm_tile),
+        static_cast<unsigned int>(groups));
+    butterfly_compact_projection_kernel<<<grid, block, 0, stream>>>(
+        input, factors, output, leading_dimension, ranks, columns, src, dst,
+        pivot_offsets, factor_offsets, pivots, add_src, add_dst, group_base,
+        beta);
   }
 }
 
@@ -279,19 +404,22 @@ extern "C" void ectrans_butterfly_grouped_gemm_cuda(
   }
 }
 
-extern "C" void ectrans_butterfly_compact_gemm_cuda(
-    double *buffer, const double *factors, int leading_dimension,
-    const int *ranks, const int *columns, const std::int64_t *dst,
-    const std::int64_t *scratch, const std::int64_t *factor_offsets,
-    std::int64_t add_scratch, std::int64_t add_dst, int group_count,
-    int max_outputs, double beta, std::intptr_t stream_value) {
-  launch_grouped_gemm(buffer, factors, buffer, leading_dimension, ranks,
-                      columns, ranks, scratch, dst, factor_offsets,
-                      add_scratch, add_dst, group_count, max_outputs, 1, 0, 1,
-                      beta, stream_value);
+extern "C" void ectrans_butterfly_compact_projection_cuda(
+    const double *input, const double *factors, double *output,
+    int leading_dimension, const int *ranks, const int *columns,
+    const std::int64_t *src, const std::int64_t *dst,
+    const std::int64_t *pivot_offsets,
+    const std::int64_t *factor_offsets, const int *pivots,
+    std::int64_t add_src, std::int64_t add_dst, int group_count, int max_rank,
+    double beta, std::intptr_t stream_value) {
+  launch_compact_projection(input, factors, output, leading_dimension, ranks,
+                            columns, src, dst, pivot_offsets, factor_offsets,
+                            pivots, add_src, add_dst, group_count, max_rank, beta,
+                            stream_value);
   const cudaError_t error = cudaGetLastError();
   if (error != cudaSuccess) {
-    std::fprintf(stderr, "butterfly compact GEMM CUDA launch failed: %s\n",
+    std::fprintf(stderr,
+                 "butterfly compact projection CUDA launch failed: %s\n",
                  cudaGetErrorString(error));
     std::exit(EXIT_FAILURE);
   }
