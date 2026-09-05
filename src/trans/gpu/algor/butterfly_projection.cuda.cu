@@ -6,6 +6,7 @@
 #include <mma.h>
 
 #include <cstdint>
+#include <cstring>
 #include <cstdio>
 #include <cstdlib>
 
@@ -17,6 +18,133 @@ constexpr int gemm_tile = 16;
 constexpr int warp_threads = 32;
 constexpr int wmma_field_tile = 64;
 constexpr int wmma_warps_per_block = 16;
+constexpr int warp_small_warps_per_block = 8;
+
+bool warp_small_requested() {
+  const char *value = std::getenv("ECTRANS_GPU_BUTTERFLY_WARP_SMALL");
+  return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+}
+
+int warp_small_limit() {
+  const char *value = std::getenv("ECTRANS_GPU_BUTTERFLY_WARP_SMALL_LIMIT");
+  if (value == nullptr || value[0] == '\0')
+    return 32;
+  const int parsed = std::atoi(value);
+  return parsed > 0 && parsed <= 128 ? parsed : 32;
+}
+
+__global__ void butterfly_warp_small_gemm_kernel(
+    const double *__restrict__ input, const double *__restrict__ factors,
+    double *__restrict__ output, int leading_dimension,
+    const int *__restrict__ outputs, const int *__restrict__ inner,
+    const int *__restrict__ factor_ld, const std::int64_t *__restrict__ src,
+    const std::int64_t *__restrict__ dst,
+    const std::int64_t *__restrict__ factor_offsets, std::int64_t add_src,
+    std::int64_t add_dst, int group_base, int factor_transposed,
+    int atomic_output, int compact_projection, double beta, int limit) {
+  const int group = group_base + static_cast<int>(blockIdx.z);
+  const int n = outputs[group];
+  const int k = inner[group] - (compact_projection ? n : 0);
+  if (n > limit || k > limit)
+    return;
+
+  const int warp = threadIdx.x / warp_threads;
+  const int lane = threadIdx.x % warp_threads;
+  const int ldb = compact_projection ? n : factor_ld[group];
+  const std::int64_t factor_offset = factor_offsets[group];
+  for (int column = warp; column < n;
+       column += warp_small_warps_per_block) {
+    for (int field_base = 0; field_base < leading_dimension;
+         field_base += warp_threads) {
+      const int field = field_base + lane;
+      double value = 0.0;
+      for (int index = 0; index < k; ++index) {
+        double factor = 0.0;
+        if (lane == 0) {
+          factor = factor_transposed
+                       ? factors[factor_offset + column +
+                                 static_cast<std::int64_t>(index) * ldb]
+                       : factors[factor_offset + index +
+                                 static_cast<std::int64_t>(column) * ldb];
+        }
+        factor = __shfl_sync(0xffffffffu, factor, 0);
+        if (field < leading_dimension) {
+          value += input[(src[group] + add_src + index) *
+                             leading_dimension +
+                         field] *
+                   factor;
+        }
+      }
+      if (field < leading_dimension) {
+        double *target = output +
+                         (dst[group] + add_dst + column) *
+                             leading_dimension +
+                         field;
+        if (atomic_output) {
+          atomicAdd(target, value);
+        } else {
+          *target = beta == 0.0 ? value : value + beta * *target;
+        }
+      }
+    }
+  }
+}
+
+__global__ void butterfly_warp_small_projection_kernel(
+    const double *__restrict__ input, const double *__restrict__ factors,
+    double *__restrict__ output, int leading_dimension,
+    const int *__restrict__ ranks, const int *__restrict__ columns,
+    const std::int64_t *__restrict__ src,
+    const std::int64_t *__restrict__ dst,
+    const std::int64_t *__restrict__ pivot_offsets,
+    const std::int64_t *__restrict__ factor_offsets,
+    const int *__restrict__ pivots, std::int64_t add_src,
+    std::int64_t add_dst, int group_base, double beta, int limit) {
+  const int group = group_base + static_cast<int>(blockIdx.z);
+  const int n = ranks[group];
+  const int k = columns[group] - n;
+  if (n > limit || k > limit)
+    return;
+
+  const int warp = threadIdx.x / warp_threads;
+  const int lane = threadIdx.x % warp_threads;
+  const std::int64_t pivot_offset = pivot_offsets[group];
+  const std::int64_t factor_offset = factor_offsets[group];
+  for (int column = warp; column < n;
+       column += warp_small_warps_per_block) {
+    for (int field_base = 0; field_base < leading_dimension;
+         field_base += warp_threads) {
+      const int field = field_base + lane;
+      double value = field < leading_dimension
+                         ? input[(src[group] + add_src +
+                                  pivots[pivot_offset + column]) *
+                                     leading_dimension +
+                                 field]
+                         : 0.0;
+      for (int index = 0; index < k; ++index) {
+        double factor = lane == 0
+                            ? factors[factor_offset + column +
+                                      static_cast<std::int64_t>(index) * n]
+                            : 0.0;
+        factor = __shfl_sync(0xffffffffu, factor, 0);
+        if (field < leading_dimension) {
+          value += input[(src[group] + add_src +
+                          pivots[pivot_offset + n + index]) *
+                             leading_dimension +
+                         field] *
+                   factor;
+        }
+      }
+      if (field < leading_dimension) {
+        double *target = output +
+                         (dst[group] + add_dst + column) *
+                             leading_dimension +
+                         field;
+        *target = beta == 0.0 ? value : value + beta * *target;
+      }
+    }
+  }
+}
 
 __global__ void butterfly_grouped_gemm_kernel(
     const double *__restrict__ input, const double *__restrict__ factors,
@@ -26,7 +154,7 @@ __global__ void butterfly_grouped_gemm_kernel(
     const std::int64_t *__restrict__ dst,
     const std::int64_t *__restrict__ factor_offsets, std::int64_t add_src,
     std::int64_t add_dst, int group_base, int factor_transposed,
-    int atomic_output, int compact_projection, double beta) {
+    int atomic_output, int compact_projection, double beta, int warp_limit) {
   __shared__ __align__(32) double tile_a[wmma_field_tile * 4];
   __shared__ __align__(32) double tile_b[4 * gemm_tile];
   __shared__ __align__(32) double tile_c[wmma_field_tile * gemm_tile];
@@ -35,6 +163,8 @@ __global__ void butterfly_grouped_gemm_kernel(
   const int thread = threadIdx.x;
   const int n = outputs[group];
   const int k = inner[group] - (compact_projection ? n : 0);
+  if (warp_limit > 0 && n <= warp_limit && k <= warp_limit)
+    return;
   const int ldb = compact_projection ? n : factor_ld[group];
   const std::int64_t factor_offset = factor_offsets[group];
 
@@ -133,7 +263,7 @@ __global__ void butterfly_compact_projection_kernel(
     const std::int64_t *__restrict__ pivot_offsets,
     const std::int64_t *__restrict__ factor_offsets,
     const int *__restrict__ pivots, std::int64_t add_src,
-    std::int64_t add_dst, int group_base, double beta) {
+    std::int64_t add_dst, int group_base, double beta, int warp_limit) {
   __shared__ __align__(32) double tile_a[wmma_field_tile * 4];
   __shared__ __align__(32) double tile_b[4 * gemm_tile];
   __shared__ __align__(32) double tile_c[wmma_field_tile * gemm_tile];
@@ -142,6 +272,8 @@ __global__ void butterfly_compact_projection_kernel(
   const int thread = threadIdx.x;
   const int n = ranks[group];
   const int k = columns[group] - n;
+  if (warp_limit > 0 && n <= warp_limit && k <= warp_limit)
+    return;
 
   const int warp = thread / warp_threads;
   const int warp_row = (warp & 7) * 8;
@@ -240,7 +372,9 @@ void launch_grouped_gemm(
     return;
 
   const dim3 block(wmma_warps_per_block * warp_threads);
+  const dim3 warp_block(warp_small_warps_per_block * warp_threads);
   const auto stream = reinterpret_cast<cudaStream_t>(stream_value);
+  const int limit = warp_small_requested() ? warp_small_limit() : 0;
   constexpr int max_grid_z = 65535;
   for (int group_base = 0; group_base < group_count;
        group_base += max_grid_z) {
@@ -248,10 +382,16 @@ void launch_grouped_gemm(
         group_count - group_base < max_grid_z ? group_count - group_base
                                                : max_grid_z;
     const dim3 grid(1, 1, static_cast<unsigned int>(groups));
+    if (limit > 0) {
+      butterfly_warp_small_gemm_kernel<<<grid, warp_block, 0, stream>>>(
+          input, factors, output, leading_dimension, outputs, inner, factor_ld,
+          src, dst, factor_offsets, add_src, add_dst, group_base,
+          factor_transposed, atomic_output, compact_projection, beta, limit);
+    }
     butterfly_grouped_gemm_kernel<<<grid, block, 0, stream>>>(
         input, factors, output, leading_dimension, outputs, inner, factor_ld,
         src, dst, factor_offsets, add_src, add_dst, group_base,
-        factor_transposed, atomic_output, compact_projection, beta);
+        factor_transposed, atomic_output, compact_projection, beta, limit);
   }
 }
 
@@ -267,7 +407,9 @@ void launch_compact_projection(
     return;
 
   const dim3 block(wmma_warps_per_block * warp_threads);
+  const dim3 warp_block(warp_small_warps_per_block * warp_threads);
   const auto stream = reinterpret_cast<cudaStream_t>(stream_value);
+  const int limit = warp_small_requested() ? warp_small_limit() : 0;
   constexpr int max_grid_z = 65535;
   for (int group_base = 0; group_base < group_count;
        group_base += max_grid_z) {
@@ -275,10 +417,16 @@ void launch_compact_projection(
         group_count - group_base < max_grid_z ? group_count - group_base
                                                : max_grid_z;
     const dim3 grid(1, 1, static_cast<unsigned int>(groups));
+    if (limit > 0) {
+      butterfly_warp_small_projection_kernel<<<grid, warp_block, 0, stream>>>(
+          input, factors, output, leading_dimension, ranks, columns, src, dst,
+          pivot_offsets, factor_offsets, pivots, add_src, add_dst, group_base,
+          beta, limit);
+    }
     butterfly_compact_projection_kernel<<<grid, block, 0, stream>>>(
         input, factors, output, leading_dimension, ranks, columns, src, dst,
         pivot_offsets, factor_offsets, pivots, add_src, add_dst, group_base,
-        beta);
+        beta, limit);
   }
 }
 
