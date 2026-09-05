@@ -31,83 +31,89 @@ __global__ void butterfly_grouped_gemm_kernel(
 
   const int group = group_base + static_cast<int>(blockIdx.z);
   const int thread = threadIdx.x;
-  const int field_base = static_cast<int>(blockIdx.x) * gemm_tile;
-  const int column_base = static_cast<int>(blockIdx.y) * gemm_tile;
   const int n = outputs[group];
   const int k = inner[group] - (compact_projection ? n : 0);
   const int ldb = compact_projection ? n : factor_ld[group];
-  if (column_base >= n)
-    return;
+  const std::int64_t factor_offset = factor_offsets[group];
 
   const int warp = thread / warp_threads;
   const int warp_row = (warp & 1) * 8;
   const int warp_column = (warp >> 1) * 8;
-  nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 8, 8, 4, double,
-                         nvcuda::wmma::col_major>
-      a_fragment;
-  nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 8, 8, 4, double,
-                         nvcuda::wmma::col_major>
-      b_fragment;
-  nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 8, 8, 4, double>
-      accumulator;
-  nvcuda::wmma::fill_fragment(accumulator, 0.0);
+  for (int field_base = 0; field_base < leading_dimension;
+       field_base += gemm_tile) {
+    for (int column_base = 0; column_base < n; column_base += gemm_tile) {
+      nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 8, 8, 4, double,
+                             nvcuda::wmma::col_major>
+          a_fragment;
+      nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 8, 8, 4, double,
+                             nvcuda::wmma::col_major>
+          b_fragment;
+      nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 8, 8, 4, double>
+          accumulator;
+      nvcuda::wmma::fill_fragment(accumulator, 0.0);
 
-  for (int k_base = 0; k_base < k; k_base += 4) {
-    if (thread < gemm_tile * 4) {
-      const int row = thread % gemm_tile;
-      const int local_k = thread / gemm_tile;
-      const int field = field_base + row;
-      const int global_k = k_base + local_k;
-      tile_a[thread] =
-          field < leading_dimension && global_k < k
-              ? input[(src[group] + add_src + global_k) * leading_dimension +
-                      field]
-              : 0.0;
+      for (int k_base = 0; k_base < k; k_base += 4) {
+        if (thread < gemm_tile * 4) {
+          const int row = thread % gemm_tile;
+          const int local_k = thread / gemm_tile;
+          const int field = field_base + row;
+          const int global_k = k_base + local_k;
+          tile_a[thread] =
+              field < leading_dimension && global_k < k
+                  ? input[(src[group] + add_src + global_k) *
+                              leading_dimension +
+                          field]
+                  : 0.0;
 
-      const int b_k = thread % 4;
-      const int local_column = thread / 4;
-      const int column = column_base + local_column;
-      const std::int64_t offset = factor_offsets[group];
-      tile_b[thread] =
-          k_base + b_k < k && column < n
-              ? (factor_transposed
-                     ? factors[offset + column +
-                               static_cast<std::int64_t>(k_base + b_k) *
-                                   ldb]
-                     : factors[offset + k_base + b_k +
-                               static_cast<std::int64_t>(column) *
-                                   ldb])
-              : 0.0;
-    }
-    __syncthreads();
+          const int b_k = thread % 4;
+          const int local_column = thread / 4;
+          const int column = column_base + local_column;
+          tile_b[thread] =
+              k_base + b_k < k && column < n
+                  ? (factor_transposed
+                         ? factors[factor_offset + column +
+                                   static_cast<std::int64_t>(k_base + b_k) *
+                                       ldb]
+                         : factors[factor_offset + k_base + b_k +
+                                   static_cast<std::int64_t>(column) * ldb])
+                  : 0.0;
+        }
+        __syncthreads();
 
-    nvcuda::wmma::load_matrix_sync(a_fragment, tile_a + warp_row, gemm_tile);
-    nvcuda::wmma::load_matrix_sync(b_fragment,
-                                   tile_b + warp_column * 4, 4);
-    nvcuda::wmma::mma_sync(accumulator, a_fragment, b_fragment, accumulator);
-    __syncthreads();
-  }
-
-  nvcuda::wmma::store_matrix_sync(
-      tile_c + warp_row + warp_column * gemm_tile, accumulator, gemm_tile,
-      nvcuda::wmma::mem_col_major);
-  __syncthreads();
-
-  for (int index = thread; index < gemm_tile * gemm_tile;
-       index += blockDim.x) {
-    const int row = index % gemm_tile;
-    const int local_column = index / gemm_tile;
-    const int field = field_base + row;
-    const int column = column_base + local_column;
-    if (field < leading_dimension && column < n) {
-      double *target =
-          output + (dst[group] + add_dst + column) * leading_dimension + field;
-      const double value = tile_c[index];
-      if (atomic_output) {
-        atomicAdd(target, value);
-      } else {
-        *target = beta == 0.0 ? value : value + beta * *target;
+        nvcuda::wmma::load_matrix_sync(a_fragment, tile_a + warp_row,
+                                       gemm_tile);
+        nvcuda::wmma::load_matrix_sync(b_fragment,
+                                       tile_b + warp_column * 4, 4);
+        nvcuda::wmma::mma_sync(accumulator, a_fragment, b_fragment,
+                               accumulator);
+        __syncthreads();
       }
+
+      nvcuda::wmma::store_matrix_sync(
+          tile_c + warp_row + warp_column * gemm_tile, accumulator, gemm_tile,
+          nvcuda::wmma::mem_col_major);
+      __syncthreads();
+
+      for (int index = thread; index < gemm_tile * gemm_tile;
+           index += blockDim.x) {
+        const int row = index % gemm_tile;
+        const int local_column = index / gemm_tile;
+        const int field = field_base + row;
+        const int column = column_base + local_column;
+        if (field < leading_dimension && column < n) {
+          double *target = output +
+                           (dst[group] + add_dst + column) *
+                               leading_dimension +
+                           field;
+          const double value = tile_c[index];
+          if (atomic_output) {
+            atomicAdd(target, value);
+          } else {
+            *target = beta == 0.0 ? value : value + beta * *target;
+          }
+        }
+      }
+      __syncthreads();
     }
   }
 }
@@ -128,80 +134,87 @@ __global__ void butterfly_compact_projection_kernel(
 
   const int group = group_base + static_cast<int>(blockIdx.z);
   const int thread = threadIdx.x;
-  const int field_base = static_cast<int>(blockIdx.x) * gemm_tile;
-  const int column_base = static_cast<int>(blockIdx.y) * gemm_tile;
   const int n = ranks[group];
   const int k = columns[group] - n;
-  if (column_base >= n)
-    return;
 
   const int warp = thread / warp_threads;
   const int warp_row = (warp & 1) * 8;
   const int warp_column = (warp >> 1) * 8;
-  nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 8, 8, 4, double,
-                         nvcuda::wmma::col_major>
-      a_fragment;
-  nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 8, 8, 4, double,
-                         nvcuda::wmma::col_major>
-      b_fragment;
-  nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 8, 8, 4, double>
-      accumulator;
-  nvcuda::wmma::fill_fragment(accumulator, 0.0);
-
   const std::int64_t pivot_offset = pivot_offsets[group];
   const std::int64_t factor_offset = factor_offsets[group];
-  for (int k_base = 0; k_base < k; k_base += 4) {
-    if (thread < gemm_tile * 4) {
-      const int row = thread % gemm_tile;
-      const int local_k = thread / gemm_tile;
-      const int field = field_base + row;
-      const int global_k = k_base + local_k;
-      tile_a[thread] =
-          field < leading_dimension && global_k < k
-              ? input[(src[group] + add_src +
-                       pivots[pivot_offset + n + global_k]) *
-                          leading_dimension +
-                      field]
-              : 0.0;
+  for (int field_base = 0; field_base < leading_dimension;
+       field_base += gemm_tile) {
+    for (int column_base = 0; column_base < n; column_base += gemm_tile) {
+      nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 8, 8, 4, double,
+                             nvcuda::wmma::col_major>
+          a_fragment;
+      nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 8, 8, 4, double,
+                             nvcuda::wmma::col_major>
+          b_fragment;
+      nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 8, 8, 4, double>
+          accumulator;
+      nvcuda::wmma::fill_fragment(accumulator, 0.0);
 
-      const int b_k = thread % 4;
-      const int local_column = thread / 4;
-      const int column = column_base + local_column;
-      tile_b[thread] =
-          k_base + b_k < k && column < n
-              ? factors[factor_offset + column +
-                        static_cast<std::int64_t>(k_base + b_k) * n]
-              : 0.0;
-    }
-    __syncthreads();
+      for (int k_base = 0; k_base < k; k_base += 4) {
+        if (thread < gemm_tile * 4) {
+          const int row = thread % gemm_tile;
+          const int local_k = thread / gemm_tile;
+          const int field = field_base + row;
+          const int global_k = k_base + local_k;
+          tile_a[thread] =
+              field < leading_dimension && global_k < k
+                  ? input[(src[group] + add_src +
+                           pivots[pivot_offset + n + global_k]) *
+                              leading_dimension +
+                          field]
+                  : 0.0;
 
-    nvcuda::wmma::load_matrix_sync(a_fragment, tile_a + warp_row, gemm_tile);
-    nvcuda::wmma::load_matrix_sync(b_fragment,
-                                   tile_b + warp_column * 4, 4);
-    nvcuda::wmma::mma_sync(accumulator, a_fragment, b_fragment, accumulator);
-    __syncthreads();
-  }
+          const int b_k = thread % 4;
+          const int local_column = thread / 4;
+          const int column = column_base + local_column;
+          tile_b[thread] =
+              k_base + b_k < k && column < n
+                  ? factors[factor_offset + column +
+                            static_cast<std::int64_t>(k_base + b_k) * n]
+                  : 0.0;
+        }
+        __syncthreads();
 
-  nvcuda::wmma::store_matrix_sync(
-      tile_c + warp_row + warp_column * gemm_tile, accumulator, gemm_tile,
-      nvcuda::wmma::mem_col_major);
-  __syncthreads();
+        nvcuda::wmma::load_matrix_sync(a_fragment, tile_a + warp_row,
+                                       gemm_tile);
+        nvcuda::wmma::load_matrix_sync(b_fragment,
+                                       tile_b + warp_column * 4, 4);
+        nvcuda::wmma::mma_sync(accumulator, a_fragment, b_fragment,
+                               accumulator);
+        __syncthreads();
+      }
 
-  for (int index = thread; index < gemm_tile * gemm_tile;
-       index += blockDim.x) {
-    const int row = index % gemm_tile;
-    const int local_column = index / gemm_tile;
-    const int field = field_base + row;
-    const int column = column_base + local_column;
-    if (field < leading_dimension && column < n) {
-      const double pivot =
-          input[(src[group] + add_src + pivots[pivot_offset + column]) *
-                    leading_dimension +
-                field];
-      double *target =
-          output + (dst[group] + add_dst + column) * leading_dimension + field;
-      const double value = pivot + tile_c[index];
-      *target = beta == 0.0 ? value : value + beta * *target;
+      nvcuda::wmma::store_matrix_sync(
+          tile_c + warp_row + warp_column * gemm_tile, accumulator, gemm_tile,
+          nvcuda::wmma::mem_col_major);
+      __syncthreads();
+
+      for (int index = thread; index < gemm_tile * gemm_tile;
+           index += blockDim.x) {
+        const int row = index % gemm_tile;
+        const int local_column = index / gemm_tile;
+        const int field = field_base + row;
+        const int column = column_base + local_column;
+        if (field < leading_dimension && column < n) {
+          const double pivot =
+              input[(src[group] + add_src +
+                     pivots[pivot_offset + column]) *
+                        leading_dimension +
+                    field];
+          double *target = output +
+                           (dst[group] + add_dst + column) *
+                               leading_dimension +
+                           field;
+          const double value = pivot + tile_c[index];
+          *target = beta == 0.0 ? value : value + beta * *target;
+        }
+      }
+      __syncthreads();
     }
   }
 }
@@ -225,11 +238,7 @@ void launch_grouped_gemm(
     const int groups =
         group_count - group_base < max_grid_z ? group_count - group_base
                                                : max_grid_z;
-    const dim3 grid(
-        static_cast<unsigned int>((leading_dimension + gemm_tile - 1) /
-                                  gemm_tile),
-        static_cast<unsigned int>((max_outputs + gemm_tile - 1) / gemm_tile),
-        static_cast<unsigned int>(groups));
+    const dim3 grid(1, 1, static_cast<unsigned int>(groups));
     butterfly_grouped_gemm_kernel<<<grid, block, 0, stream>>>(
         input, factors, output, leading_dimension, outputs, inner, factor_ld,
         src, dst, factor_offsets, add_src, add_dst, group_base,
@@ -256,11 +265,7 @@ void launch_compact_projection(
     const int groups =
         group_count - group_base < max_grid_z ? group_count - group_base
                                                : max_grid_z;
-    const dim3 grid(
-        static_cast<unsigned int>((leading_dimension + gemm_tile - 1) /
-                                  gemm_tile),
-        static_cast<unsigned int>((max_rank + gemm_tile - 1) / gemm_tile),
-        static_cast<unsigned int>(groups));
+    const dim3 grid(1, 1, static_cast<unsigned int>(groups));
     butterfly_compact_projection_kernel<<<grid, block, 0, stream>>>(
         input, factors, output, leading_dimension, ranks, columns, src, dst,
         pivot_offsets, factor_offsets, pivots, add_src, add_dst, group_base,
