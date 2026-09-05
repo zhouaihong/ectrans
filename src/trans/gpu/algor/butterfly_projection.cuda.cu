@@ -24,7 +24,7 @@ __global__ void butterfly_grouped_gemm_kernel(
     const std::int64_t *__restrict__ dst,
     const std::int64_t *__restrict__ factor_offsets, std::int64_t add_src,
     std::int64_t add_dst, int group_base, int factor_transposed,
-    int atomic_output, double beta) {
+    int atomic_output, int compact_projection, double beta) {
   __shared__ __align__(32) double tile_a[gemm_tile * 4];
   __shared__ __align__(32) double tile_b[4 * gemm_tile];
   __shared__ __align__(32) double tile_c[gemm_tile * gemm_tile];
@@ -34,7 +34,8 @@ __global__ void butterfly_grouped_gemm_kernel(
   const int field_base = static_cast<int>(blockIdx.x) * gemm_tile;
   const int column_base = static_cast<int>(blockIdx.y) * gemm_tile;
   const int n = outputs[group];
-  const int k = inner[group];
+  const int k = inner[group] - (compact_projection ? n : 0);
+  const int ldb = compact_projection ? n : factor_ld[group];
   if (column_base >= n)
     return;
 
@@ -72,10 +73,10 @@ __global__ void butterfly_grouped_gemm_kernel(
               ? (factor_transposed
                      ? factors[offset + column +
                                static_cast<std::int64_t>(k_base + b_k) *
-                                   factor_ld[group]]
+                                   ldb]
                      : factors[offset + k_base + b_k +
                                static_cast<std::int64_t>(column) *
-                                   factor_ld[group]])
+                                   ldb])
               : 0.0;
     }
     __syncthreads();
@@ -108,6 +109,37 @@ __global__ void butterfly_grouped_gemm_kernel(
         *target = beta == 0.0 ? value : value + beta * *target;
       }
     }
+  }
+}
+
+void launch_grouped_gemm(
+    const double *input, const double *factors, double *output,
+    int leading_dimension, const int *outputs, const int *inner,
+    const int *factor_ld, const std::int64_t *src, const std::int64_t *dst,
+    const std::int64_t *factor_offsets, std::int64_t add_src,
+    std::int64_t add_dst, int group_count, int max_outputs,
+    int factor_transposed, int atomic_output, int compact_projection,
+    double beta, std::intptr_t stream_value) {
+  if (leading_dimension <= 0 || group_count <= 0 || max_outputs <= 0)
+    return;
+
+  const dim3 block(4 * warp_threads);
+  const auto stream = reinterpret_cast<cudaStream_t>(stream_value);
+  constexpr int max_grid_z = 65535;
+  for (int group_base = 0; group_base < group_count;
+       group_base += max_grid_z) {
+    const int groups =
+        group_count - group_base < max_grid_z ? group_count - group_base
+                                               : max_grid_z;
+    const dim3 grid(
+        static_cast<unsigned int>((leading_dimension + gemm_tile - 1) /
+                                  gemm_tile),
+        static_cast<unsigned int>((max_outputs + gemm_tile - 1) / gemm_tile),
+        static_cast<unsigned int>(groups));
+    butterfly_grouped_gemm_kernel<<<grid, block, 0, stream>>>(
+        input, factors, output, leading_dimension, outputs, inner, factor_ld,
+        src, dst, factor_offsets, add_src, add_dst, group_base,
+        factor_transposed, atomic_output, compact_projection, beta);
   }
 }
 
@@ -235,30 +267,31 @@ extern "C" void ectrans_butterfly_grouped_gemm_cuda(
     std::int64_t add_dst, int group_count, int max_outputs,
     int factor_transposed, int atomic_output, double beta,
     std::intptr_t stream_value) {
-  if (leading_dimension <= 0 || group_count <= 0 || max_outputs <= 0)
-    return;
-
-  const dim3 block(4 * warp_threads);
-  const auto stream = reinterpret_cast<cudaStream_t>(stream_value);
-  constexpr int max_grid_z = 65535;
-  for (int group_base = 0; group_base < group_count;
-       group_base += max_grid_z) {
-    const int groups =
-        group_count - group_base < max_grid_z ? group_count - group_base
-                                               : max_grid_z;
-    const dim3 grid(
-        static_cast<unsigned int>((leading_dimension + gemm_tile - 1) /
-                                  gemm_tile),
-        static_cast<unsigned int>((max_outputs + gemm_tile - 1) / gemm_tile),
-        static_cast<unsigned int>(groups));
-    butterfly_grouped_gemm_kernel<<<grid, block, 0, stream>>>(
-        input, factors, output, leading_dimension, outputs, inner, factor_ld,
-        src, dst, factor_offsets, add_src, add_dst, group_base,
-        factor_transposed, atomic_output, beta);
-  }
+  launch_grouped_gemm(input, factors, output, leading_dimension, outputs,
+                      inner, factor_ld, src, dst, factor_offsets, add_src,
+                      add_dst, group_count, max_outputs, factor_transposed,
+                      atomic_output, 0, beta, stream_value);
   const cudaError_t error = cudaGetLastError();
   if (error != cudaSuccess) {
     std::fprintf(stderr, "butterfly grouped GEMM CUDA launch failed: %s\n",
+                 cudaGetErrorString(error));
+    std::exit(EXIT_FAILURE);
+  }
+}
+
+extern "C" void ectrans_butterfly_compact_gemm_cuda(
+    double *buffer, const double *factors, int leading_dimension,
+    const int *ranks, const int *columns, const std::int64_t *dst,
+    const std::int64_t *scratch, const std::int64_t *factor_offsets,
+    std::int64_t add_scratch, std::int64_t add_dst, int group_count,
+    int max_outputs, double beta, std::intptr_t stream_value) {
+  launch_grouped_gemm(buffer, factors, buffer, leading_dimension, ranks,
+                      columns, ranks, scratch, dst, factor_offsets,
+                      add_scratch, add_dst, group_count, max_outputs, 1, 0, 1,
+                      beta, stream_value);
+  const cudaError_t error = cudaGetLastError();
+  if (error != cudaSuccess) {
+    std::fprintf(stderr, "butterfly compact GEMM CUDA launch failed: %s\n",
                  cudaGetErrorString(error));
     std::exit(EXIT_FAILURE);
   }
