@@ -851,6 +851,17 @@ extern "C" void ectrans_butterfly_fused_leaf_direct_cuda(
   const std::size_t shared_bytes =
       static_cast<std::size_t>(max_rank) * fused_leaf_field_tile *
       sizeof(double);
+  const cudaError_t attribute_error = cudaFuncSetAttribute(
+      butterfly_fused_leaf_direct_kernel,
+      cudaFuncAttributeMaxDynamicSharedMemorySize,
+      static_cast<int>(shared_bytes));
+  if (attribute_error != cudaSuccess) {
+    std::fprintf(stderr,
+                 "butterfly fused leaf shared-memory request (%zu bytes) "
+                 "failed: %s\n",
+                 shared_bytes, cudaGetErrorString(attribute_error));
+    std::exit(EXIT_FAILURE);
+  }
   const auto stream = reinterpret_cast<cudaStream_t>(stream_value);
   butterfly_fused_leaf_direct_kernel<<<grid, block, shared_bytes, stream>>>(
       input, factors, output, leading_dimension, rows, ranks, columns,
