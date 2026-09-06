@@ -404,6 +404,183 @@ __global__ void butterfly_compact_projection_kernel(
   }
 }
 
+__global__ void butterfly_compact_reverse_kernel(
+    const double *__restrict__ input, const double *__restrict__ factors,
+    double *__restrict__ output, int leading_dimension,
+    const int *__restrict__ ranks, const int *__restrict__ columns,
+    const std::int64_t *__restrict__ src,
+    const std::int64_t *__restrict__ dst,
+    const std::int64_t *__restrict__ pivot_offsets,
+    const std::int64_t *__restrict__ factor_offsets,
+    const int *__restrict__ pivots, std::int64_t add_src,
+    std::int64_t add_dst, int group_base, double beta) {
+  __shared__ __align__(32) double tile_a[wmma_field_tile * wmma_k_tile];
+  __shared__ __align__(32) double tile_b[wmma_k_tile * gemm_tile];
+  __shared__ __align__(32) double tile_c[wmma_field_tile * gemm_tile];
+
+  const int group = group_base + static_cast<int>(blockIdx.z);
+  const int thread = threadIdx.x;
+  const int rank = ranks[group];
+  const int nonrank = columns[group] - rank;
+  const int warp = thread / warp_threads;
+  const int warp_row = (warp % wmma_field_warps) * 8;
+  const int warp_column = (warp / wmma_field_warps) * 8;
+  const std::int64_t pivot_offset = pivot_offsets[group];
+  const std::int64_t factor_offset = factor_offsets[group];
+  const bool grid_tiled = gridDim.x > 1 || gridDim.y > 1;
+  const int first_field =
+      grid_tiled ? static_cast<int>(blockIdx.x) * wmma_field_tile : 0;
+  const int last_field = grid_tiled ? first_field + wmma_field_tile
+                                    : leading_dimension;
+  const int first_column =
+      grid_tiled ? static_cast<int>(blockIdx.y) * gemm_tile : 0;
+  const int last_column =
+      grid_tiled ? first_column + gemm_tile : columns[group];
+
+  for (int field_base = first_field;
+       field_base < leading_dimension && field_base < last_field;
+       field_base += wmma_field_tile) {
+    for (int column_base = first_column;
+         column_base < columns[group] && column_base < last_column;
+         column_base += gemm_tile) {
+      nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 8, 8, 4, double,
+                             nvcuda::wmma::col_major>
+          a_fragment;
+      nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 8, 8, 4, double,
+                             nvcuda::wmma::col_major>
+          b_fragment;
+      nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 8, 8, 4, double>
+          accumulator;
+      nvcuda::wmma::fill_fragment(accumulator, 0.0);
+
+      for (int k_base = 0; k_base < rank; k_base += wmma_k_tile) {
+        for (int index = thread; index < wmma_field_tile * wmma_k_tile;
+             index += blockDim.x) {
+          const int row = index % wmma_field_tile;
+          const int local_k = index / wmma_field_tile;
+          const int field = field_base + row;
+          const int global_k = k_base + local_k;
+          tile_a[index] =
+              field < leading_dimension && global_k < rank
+                  ? input[(dst[group] + add_src + global_k) *
+                              leading_dimension +
+                          field]
+                  : 0.0;
+        }
+        for (int index = thread; index < wmma_k_tile * gemm_tile;
+             index += blockDim.x) {
+          const int local_k = index % wmma_k_tile;
+          const int local_column = index / wmma_k_tile;
+          const int global_k = k_base + local_k;
+          const int nonrank_column = column_base + local_column;
+          tile_b[index] =
+              global_k < rank && nonrank_column < nonrank
+                  ? factors[factor_offset + global_k +
+                            static_cast<std::int64_t>(nonrank_column) * rank]
+                  : 0.0;
+        }
+        __syncthreads();
+
+        for (int k_tile = 0;
+             k_tile < wmma_k_tile && k_base + k_tile < rank; k_tile += 4) {
+          nvcuda::wmma::load_matrix_sync(
+              a_fragment, tile_a + warp_row + k_tile * wmma_field_tile,
+              wmma_field_tile);
+          nvcuda::wmma::load_matrix_sync(
+              b_fragment, tile_b + k_tile + warp_column * wmma_k_tile,
+              wmma_k_tile);
+          nvcuda::wmma::mma_sync(accumulator, a_fragment, b_fragment,
+                                 accumulator);
+        }
+        __syncthreads();
+      }
+
+      nvcuda::wmma::store_matrix_sync(
+          tile_c + warp_row + warp_column * wmma_field_tile, accumulator,
+          wmma_field_tile, nvcuda::wmma::mem_col_major);
+      __syncthreads();
+
+      for (int index = thread; index < wmma_field_tile * gemm_tile;
+           index += blockDim.x) {
+        const int field_lane = index % wmma_field_tile;
+        const int local_column = index / wmma_field_tile;
+        const int field = field_base + field_lane;
+        const int column = column_base + local_column;
+        if (field >= leading_dimension)
+          continue;
+        if (column < rank) {
+          double *target =
+              output +
+              (src[group] + add_dst + pivots[pivot_offset + column]) *
+                  leading_dimension +
+              field;
+          const double value =
+              input[(dst[group] + add_src + column) * leading_dimension +
+                    field];
+          if (beta == 0.0)
+            *target = value;
+          else if (beta == 1.0)
+            atomicAdd(target, value);
+          else
+            *target = value + beta * *target;
+        }
+        if (column < nonrank) {
+          double *target =
+              output +
+              (src[group] + add_dst +
+               pivots[pivot_offset + rank + column]) *
+                  leading_dimension +
+              field;
+          const double value = tile_c[index];
+          if (beta == 0.0)
+            *target = value;
+          else if (beta == 1.0)
+            atomicAdd(target, value);
+          else
+            *target = value + beta * *target;
+        }
+      }
+      __syncthreads();
+    }
+  }
+}
+
+void launch_compact_reverse(
+    const double *input, const double *factors, double *output,
+    int leading_dimension, const int *ranks, const int *columns,
+    const std::int64_t *src, const std::int64_t *dst,
+    const std::int64_t *pivot_offsets,
+    const std::int64_t *factor_offsets, const int *pivots,
+    std::int64_t add_src, std::int64_t add_dst, int group_count,
+    int max_columns, double beta, std::intptr_t stream_value) {
+  if (leading_dimension <= 0 || group_count <= 0 || max_columns <= 0)
+    return;
+
+  const dim3 block(wmma_warps_per_block * warp_threads);
+  const auto stream = reinterpret_cast<cudaStream_t>(stream_value);
+  const bool grid_tiled = grid_tiled_requested();
+  constexpr int max_grid_z = 65535;
+  for (int group_base = 0; group_base < group_count;
+       group_base += max_grid_z) {
+    const int groups =
+        group_count - group_base < max_grid_z ? group_count - group_base
+                                               : max_grid_z;
+    const dim3 grid(
+        grid_tiled ? static_cast<unsigned int>(
+                         (leading_dimension + wmma_field_tile - 1) /
+                         wmma_field_tile)
+                   : 1u,
+        grid_tiled ? static_cast<unsigned int>(
+                         (max_columns + gemm_tile - 1) / gemm_tile)
+                   : 1u,
+        static_cast<unsigned int>(groups));
+    butterfly_compact_reverse_kernel<<<grid, block, 0, stream>>>(
+        input, factors, output, leading_dimension, ranks, columns, src, dst,
+        pivot_offsets, factor_offsets, pivots, add_src, add_dst, group_base,
+        beta);
+  }
+}
+
 void launch_grouped_gemm(
     const double *input, const double *factors, double *output,
     int leading_dimension, const int *outputs, const int *inner,
@@ -830,6 +1007,27 @@ extern "C" void ectrans_butterfly_compact_projection_cuda(
   if (error != cudaSuccess) {
     std::fprintf(stderr,
                  "butterfly compact projection CUDA launch failed: %s\n",
+                 cudaGetErrorString(error));
+    std::exit(EXIT_FAILURE);
+  }
+}
+
+extern "C" void ectrans_butterfly_compact_reverse_cuda(
+    const double *input, const double *factors, double *output,
+    int leading_dimension, const int *ranks, const int *columns,
+    const std::int64_t *src, const std::int64_t *dst,
+    const std::int64_t *pivot_offsets,
+    const std::int64_t *factor_offsets, const int *pivots,
+    std::int64_t add_src, std::int64_t add_dst, int group_count,
+    int max_columns, double beta, std::intptr_t stream_value) {
+  launch_compact_reverse(input, factors, output, leading_dimension, ranks,
+                         columns, src, dst, pivot_offsets, factor_offsets,
+                         pivots, add_src, add_dst, group_count, max_columns,
+                         beta, stream_value);
+  const cudaError_t error = cudaGetLastError();
+  if (error != cudaSuccess) {
+    std::fprintf(stderr,
+                 "butterfly compact reverse CUDA launch failed: %s\n",
                  cudaGetErrorString(error));
     std::exit(EXIT_FAILURE);
   }
