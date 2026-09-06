@@ -20,7 +20,7 @@ constexpr int warp_threads = 32;
 constexpr int wmma_field_tile = 64;
 constexpr int wmma_warps_per_block = 16;
 constexpr int warp_small_warps_per_block = 8;
-constexpr int fused_leaf_field_tile = 32;
+constexpr int fused_leaf_field_tile = wmma_field_tile;
 
 bool warp_small_requested() {
   const char *value = std::getenv("ECTRANS_GPU_BUTTERFLY_WARP_SMALL");
@@ -521,60 +521,164 @@ __global__ void butterfly_fused_leaf_direct_kernel(
     const std::int64_t *__restrict__ projection_factor_offsets,
     const std::int64_t *__restrict__ pivot_offsets,
     const int *__restrict__ pivots) {
+  __shared__ __align__(32) double tile_a[wmma_field_tile * 4];
+  __shared__ __align__(32) double tile_b[4 * gemm_tile];
+  __shared__ __align__(32) double tile_c[wmma_field_tile * gemm_tile];
   extern __shared__ double beta[];
   const int group = static_cast<int>(blockIdx.x);
+  const int thread = threadIdx.x;
   const int row_count = rows[group];
   const int rank = ranks[group];
   const int column_count = columns[group];
+  const int nonidentity = column_count - rank;
   const std::int64_t input_column = input_columns[group];
   const std::int64_t output_column = output_columns[group];
   const std::int64_t final_offset = final_factor_offsets[group];
   const std::int64_t projection_offset =
       projection_factor_offsets[group];
   const std::int64_t pivot_offset = pivot_offsets[group];
+  const int warp = thread / warp_threads;
+  const int warp_row = (warp & 7) * 8;
+  const int warp_column = (warp >> 3) * 8;
 
   for (int field_base = 0; field_base < leading_dimension;
        field_base += fused_leaf_field_tile) {
-    for (int index = threadIdx.x; index < rank * fused_leaf_field_tile;
-         index += blockDim.x) {
-      const int field_lane = index % fused_leaf_field_tile;
-      const int rank_index = index / fused_leaf_field_tile;
-      const int field = field_base + field_lane;
-      double value = 0.0;
-      if (field < leading_dimension) {
-        value = input[(input_column + pivots[pivot_offset + rank_index]) *
-                          leading_dimension +
-                      field];
-        for (int column = rank; column < column_count; ++column) {
-          value += input[(input_column + pivots[pivot_offset + column]) *
-                             leading_dimension +
-                         field] *
-                   factors[projection_offset + rank_index +
-                           static_cast<std::int64_t>(column - rank) * rank];
+    for (int rank_base = 0; rank_base < rank; rank_base += gemm_tile) {
+      nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 8, 8, 4, double,
+                             nvcuda::wmma::col_major>
+          a_fragment;
+      nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 8, 8, 4, double,
+                             nvcuda::wmma::col_major>
+          b_fragment;
+      nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 8, 8, 4, double>
+          accumulator;
+      nvcuda::wmma::fill_fragment(accumulator, 0.0);
+
+      for (int k_base = 0; k_base < nonidentity; k_base += 4) {
+        for (int index = thread; index < wmma_field_tile * 4;
+             index += blockDim.x) {
+          const int field_lane = index % wmma_field_tile;
+          const int local_k = index / wmma_field_tile;
+          const int field = field_base + field_lane;
+          const int global_k = k_base + local_k;
+          tile_a[index] =
+              field < leading_dimension && global_k < nonidentity
+                  ? input[(input_column +
+                           pivots[pivot_offset + rank + global_k]) *
+                              leading_dimension +
+                          field]
+                  : 0.0;
+        }
+        for (int index = thread; index < 4 * gemm_tile;
+             index += blockDim.x) {
+          const int local_k = index % 4;
+          const int local_rank = index / 4;
+          const int rank_index = rank_base + local_rank;
+          tile_b[index] =
+              k_base + local_k < nonidentity && rank_index < rank
+                  ? factors[projection_offset + rank_index +
+                            static_cast<std::int64_t>(k_base + local_k) * rank]
+                  : 0.0;
+        }
+        __syncthreads();
+
+        nvcuda::wmma::load_matrix_sync(a_fragment, tile_a + warp_row,
+                                       wmma_field_tile);
+        nvcuda::wmma::load_matrix_sync(b_fragment,
+                                       tile_b + warp_column * 4, 4);
+        nvcuda::wmma::mma_sync(accumulator, a_fragment, b_fragment,
+                               accumulator);
+        __syncthreads();
+      }
+
+      nvcuda::wmma::store_matrix_sync(
+          tile_c + warp_row + warp_column * wmma_field_tile, accumulator,
+          wmma_field_tile, nvcuda::wmma::mem_col_major);
+      __syncthreads();
+
+      for (int index = thread; index < wmma_field_tile * gemm_tile;
+           index += blockDim.x) {
+        const int field_lane = index % wmma_field_tile;
+        const int local_rank = index / wmma_field_tile;
+        const int field = field_base + field_lane;
+        const int rank_index = rank_base + local_rank;
+        if (field < leading_dimension && rank_index < rank) {
+          beta[rank_index * fused_leaf_field_tile + field_lane] =
+              input[(input_column + pivots[pivot_offset + rank_index]) *
+                        leading_dimension +
+                    field] +
+              tile_c[index];
         }
       }
-      beta[index] = value;
+      __syncthreads();
     }
     __syncthreads();
 
-    for (int index = threadIdx.x; index < row_count * fused_leaf_field_tile;
-         index += blockDim.x) {
-      const int field_lane = index % fused_leaf_field_tile;
-      const int row = index / fused_leaf_field_tile;
-      const int field = field_base + field_lane;
-      if (field < leading_dimension) {
-        double value = 0.0;
-        for (int rank_index = 0; rank_index < rank; ++rank_index) {
-          value += beta[rank_index * fused_leaf_field_tile + field_lane] *
-                   factors[final_offset + row +
-                           static_cast<std::int64_t>(rank_index) * row_count];
+    for (int row_base = 0; row_base < row_count; row_base += gemm_tile) {
+      nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 8, 8, 4, double,
+                             nvcuda::wmma::col_major>
+          a_fragment;
+      nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 8, 8, 4, double,
+                             nvcuda::wmma::col_major>
+          b_fragment;
+      nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 8, 8, 4, double>
+          accumulator;
+      nvcuda::wmma::fill_fragment(accumulator, 0.0);
+
+      for (int k_base = 0; k_base < rank; k_base += 4) {
+        for (int index = thread; index < wmma_field_tile * 4;
+             index += blockDim.x) {
+          const int field_lane = index % wmma_field_tile;
+          const int local_k = index / wmma_field_tile;
+          const int field = field_base + field_lane;
+          const int rank_index = k_base + local_k;
+          tile_a[index] =
+              field < leading_dimension && rank_index < rank
+                  ? beta[rank_index * fused_leaf_field_tile + field_lane]
+                  : 0.0;
         }
-        atomicAdd(output +
-                      (output_column + row) * leading_dimension + field,
-                  value);
+        for (int index = thread; index < 4 * gemm_tile;
+             index += blockDim.x) {
+          const int local_k = index % 4;
+          const int local_row = index / 4;
+          const int row = row_base + local_row;
+          tile_b[index] =
+              k_base + local_k < rank && row < row_count
+                  ? factors[final_offset + row +
+                            static_cast<std::int64_t>(k_base + local_k) *
+                                row_count]
+                  : 0.0;
+        }
+        __syncthreads();
+
+        nvcuda::wmma::load_matrix_sync(a_fragment, tile_a + warp_row,
+                                       wmma_field_tile);
+        nvcuda::wmma::load_matrix_sync(b_fragment,
+                                       tile_b + warp_column * 4, 4);
+        nvcuda::wmma::mma_sync(accumulator, a_fragment, b_fragment,
+                               accumulator);
+        __syncthreads();
       }
+
+      nvcuda::wmma::store_matrix_sync(
+          tile_c + warp_row + warp_column * wmma_field_tile, accumulator,
+          wmma_field_tile, nvcuda::wmma::mem_col_major);
+      __syncthreads();
+
+      for (int index = thread; index < wmma_field_tile * gemm_tile;
+           index += blockDim.x) {
+        const int field_lane = index % wmma_field_tile;
+        const int local_row = index / wmma_field_tile;
+        const int field = field_base + field_lane;
+        const int row = row_base + local_row;
+        if (field < leading_dimension && row < row_count) {
+          atomicAdd(output +
+                        (output_column + row) * leading_dimension + field,
+                    tile_c[index]);
+        }
+      }
+      __syncthreads();
     }
-    __syncthreads();
   }
 }
 
@@ -668,7 +772,7 @@ extern "C" void ectrans_butterfly_fused_leaf_direct_cuda(
     int max_rank, std::intptr_t stream_value) {
   if (leading_dimension <= 0 || group_count <= 0 || max_rank <= 0)
     return;
-  const dim3 block(256);
+  const dim3 block(wmma_warps_per_block * warp_threads);
   const dim3 grid(static_cast<unsigned int>(group_count));
   const std::size_t shared_bytes =
       static_cast<std::size_t>(max_rank) * fused_leaf_field_tile *
