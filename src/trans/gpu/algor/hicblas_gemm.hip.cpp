@@ -76,6 +76,36 @@ bool dgemm_bucketed_enabled() {
   return enabled;
 }
 
+bool dgemm_align8_enabled() {
+  static const bool enabled = [] {
+    const char *value = std::getenv("ECTRANS_GPU_DGEMM_ALIGN8");
+    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+  }();
+  return enabled;
+}
+
+bool dgemm_standard_legendre_id(int blas_id) {
+  return blas_id == 11 || blas_id == 12 || blas_id == 21 || blas_id == 22;
+}
+
+void align_standard_legendre_shapes(int blas_id, const int *&n, const int *&k,
+                                    int batchCount,
+                                    std::vector<int> &aligned_n,
+                                    std::vector<int> &aligned_k) {
+  if (!dgemm_align8_enabled() || !dgemm_standard_legendre_id(blas_id))
+    return;
+  aligned_n.assign(n, n + batchCount);
+  aligned_k.assign(k, k + batchCount);
+  for (int i = 0; i < batchCount; ++i) {
+    if (aligned_n[i] > 0 && aligned_k[i] > 0) {
+      aligned_n[i] = (aligned_n[i] + 7) & ~7;
+      aligned_k[i] = (aligned_k[i] + 7) & ~7;
+    }
+  }
+  n = aligned_n.data();
+  k = aligned_k.data();
+}
+
 bool dgemm_quantization_diagnostics_enabled() {
   static const bool enabled = [] {
     const char *value =
@@ -1283,6 +1313,11 @@ void hipblas_dgemm_wrapper_grouped(int resol_id, int blas_id, char transa,
     op_t1 = HIPBLAS_OP_T;
   if (transb == 'T' || transb == 't')
     op_t2 = HIPBLAS_OP_T;
+
+  std::vector<int> aligned_n;
+  std::vector<int> aligned_k;
+  align_standard_legendre_shapes(blas_id, n, k, batchCount, aligned_n,
+                                  aligned_k);
 
   diagnose_dgemm_quantization(resol_id, blas_id, m, n, k, lda, offsetsA, ldb,
                               offsetsB, ldc, offsetsC, batchCount);
