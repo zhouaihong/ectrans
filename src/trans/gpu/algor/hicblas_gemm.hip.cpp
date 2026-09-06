@@ -76,6 +76,15 @@ bool dgemm_bucketed_enabled() {
   return enabled;
 }
 
+bool dgemm_quantization_diagnostics_enabled() {
+  static const bool enabled = [] {
+    const char *value =
+        std::getenv("ECTRANS_GPU_DGEMM_QUANTIZATION_DIAGNOSTICS");
+    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+  }();
+  return enabled;
+}
+
 bool cutlass_grouped_dp_enabled() {
   static const bool enabled = [] {
     const char *value = std::getenv("ECTRANS_GPU_CUTLASS_GROUPED_DP");
@@ -871,6 +880,63 @@ bool dgemm_bucketed_profitable(int m, const int *n, const int *k, int ldc,
   return true;
 }
 
+void diagnose_dgemm_quantization(
+    int resol_id, int blas_id, int m, const int *n, const int *k, int lda,
+    const int64_t *offsetsA, const int *ldb, const int64_t *offsetsB, int ldc,
+    const int64_t *offsetsC, int batchCount) {
+  if (!dgemm_quantization_diagnostics_enabled() || m <= 0 || batchCount < 8)
+    return;
+
+  const uint64_t signature = graph_debug_signature(
+      m, n, k, lda, offsetsA, ldb, offsetsB, ldc, offsetsC, batchCount);
+  static std::mutex reported_mutex;
+  static std::map<std::tuple<int, int, uint64_t>, bool> reported;
+  {
+    std::lock_guard<std::mutex> lock(reported_mutex);
+    if (!reported.emplace(std::make_tuple(resol_id, blas_id, signature), true)
+             .second)
+      return;
+  }
+
+  std::map<std::pair<int, int>, int> exact;
+  long double original_work = 0.0L;
+  int active = 0;
+  for (int i = 0; i < batchCount; ++i) {
+    if (n[i] <= 0 || k[i] <= 0)
+      continue;
+    ++exact[{n[i], k[i]}];
+    original_work += static_cast<long double>(n[i]) * k[i];
+    ++active;
+  }
+  if (active < 8)
+    return;
+
+  for (const int quantum : {4, 8, 16, 32}) {
+    std::map<std::pair<int, int>, int> k_only;
+    std::map<std::pair<int, int>, int> both;
+    long double quantized_work = 0.0L;
+    int largest = 0;
+    for (int i = 0; i < batchCount; ++i) {
+      if (n[i] <= 0 || k[i] <= 0)
+        continue;
+      const int qn = ((n[i] + quantum - 1) / quantum) * quantum;
+      const int qk = ((k[i] + quantum - 1) / quantum) * quantum;
+      ++k_only[{n[i], qk}];
+      largest = std::max(largest, ++both[{qn, qk}]);
+      quantized_work += static_cast<long double>(qn) * qk;
+    }
+    std::fprintf(
+        stderr,
+        "EC_DGEMM_QUANT rank=%s resol=%d blas=%d groups=%d quantum=%d "
+        "exact_buckets=%zu k_buckets=%zu nk_buckets=%zu largest=%d "
+        "work_ratio=%.6Lf\n",
+        graph_debug_rank(), resol_id, blas_id, active, quantum, exact.size(),
+        k_only.size(), both.size(), largest,
+        original_work == 0.0L ? 0.0L : quantized_work / original_work);
+  }
+  std::fflush(stderr);
+}
+
 void run_dgemm_bucketed(
     hipblasOperation_t transa, hipblasOperation_t transb,
     const cache_key<double> &key, int m, const int *n, const int *k,
@@ -1217,6 +1283,9 @@ void hipblas_dgemm_wrapper_grouped(int resol_id, int blas_id, char transa,
     op_t1 = HIPBLAS_OP_T;
   if (transb == 'T' || transb == 't')
     op_t2 = HIPBLAS_OP_T;
+
+  diagnose_dgemm_quantization(resol_id, blas_id, m, n, k, lda, offsetsA, ldb,
+                              offsetsB, ldc, offsetsC, batchCount);
 
 #ifdef USE_CUTLASS
   if (cutlass_grouped_dp_enabled() &&
