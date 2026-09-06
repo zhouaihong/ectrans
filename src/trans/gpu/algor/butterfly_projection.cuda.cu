@@ -422,6 +422,7 @@ __global__ void butterfly_compact_reverse_kernel(
   const int thread = threadIdx.x;
   const int rank = ranks[group];
   const int nonrank = columns[group] - rank;
+  const int output_columns = rank > nonrank ? rank : nonrank;
   const int warp = thread / warp_threads;
   const int warp_row = (warp % wmma_field_warps) * 8;
   const int warp_column = (warp / wmma_field_warps) * 8;
@@ -441,7 +442,7 @@ __global__ void butterfly_compact_reverse_kernel(
        field_base < leading_dimension && field_base < last_field;
        field_base += wmma_field_tile) {
     for (int column_base = first_column;
-         column_base < columns[group] && column_base < last_column;
+         column_base < output_columns && column_base < last_column;
          column_base += gemm_tile) {
       nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 8, 8, 4, double,
                              nvcuda::wmma::col_major>
