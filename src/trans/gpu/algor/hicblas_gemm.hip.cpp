@@ -76,6 +76,30 @@ bool dgemm_bucketed_enabled() {
   return enabled;
 }
 
+bool dgemm_bucketed_graph_enabled() {
+  static const bool enabled = [] {
+    const char *value = std::getenv("ECTRANS_GPU_DGEMM_BUCKETED_GRAPH");
+    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+  }();
+  return enabled;
+}
+
+bool dgemm_bucketed_selected(int blas_id) {
+  static const int scope = [] {
+    const char *value = std::getenv("ECTRANS_GPU_DGEMM_BUCKETED_SCOPE");
+    if (value != nullptr && std::strcmp(value, "inverse") == 0)
+      return 1;
+    if (value != nullptr && std::strcmp(value, "direct") == 0)
+      return 2;
+    return 0;
+  }();
+  if (scope == 1)
+    return blas_id == 11 || blas_id == 12;
+  if (scope == 2)
+    return blas_id == 21 || blas_id == 22;
+  return true;
+}
+
 bool dgemm_align8_enabled() {
   static const bool enabled = [] {
     const char *value = std::getenv("ECTRANS_GPU_DGEMM_ALIGN8");
@@ -770,6 +794,8 @@ struct dgemm_bucket_shape {
   }
 };
 
+int dgemm_graph_lane_limit();
+
 class dgemm_bucketed_entry {
 public:
   dgemm_bucketed_entry(int device, const double *A,
@@ -835,14 +861,19 @@ public:
 
   void run(hipblasOperation_t transa, hipblasOperation_t transb, int m,
            double alpha, int lda, double beta, int ldc, hipStream_t stream) {
-    hipblasHandle_t handle = get_hipblas_handle();
-    HICBLAS_CHECK(hipblasSetStream(handle, stream));
-    for (const auto &data : buckets_) {
-      HICBLAS_CHECK(hipblasDgemmBatched(
-          handle, transa, transb, m, data.shape.n, data.shape.k, &alpha,
-          data.A, lda, data.B, data.shape.ldb, &beta, data.C, ldc,
-          data.count));
+    if (!dgemm_bucketed_graph_enabled()) {
+      run_direct(transa, transb, m, alpha, lda, beta, ldc, stream);
+      return;
     }
+
+    std::shared_ptr<graph_exec_entry> graph;
+    {
+      std::lock_guard<std::mutex> lock(graph_mutex_);
+      if (!graph_)
+        graph_ = build_graph(transa, transb, m, alpha, lda, beta, ldc, stream);
+      graph = graph_;
+    }
+    graph->launch(stream);
   }
 
   int bucket_count() const { return static_cast<int>(buckets_.size()); }
@@ -858,10 +889,125 @@ private:
     double **C = nullptr;
   };
 
+  static void submit_bucket(hipblasHandle_t handle,
+                            hipblasOperation_t transa,
+                            hipblasOperation_t transb, int m, double alpha,
+                            int lda, double beta, int ldc, hipStream_t stream,
+                            const bucket &data) {
+    HICBLAS_CHECK(hipblasSetStream(handle, stream));
+    HICBLAS_CHECK(hipblasDgemmBatched(
+        handle, transa, transb, m, data.shape.n, data.shape.k, &alpha, data.A,
+        lda, data.B, data.shape.ldb, &beta, data.C, ldc, data.count));
+  }
+
+  void run_direct(hipblasOperation_t transa, hipblasOperation_t transb, int m,
+                  double alpha, int lda, double beta, int ldc,
+                  hipStream_t stream) {
+    hipblasHandle_t handle = get_hipblas_handle();
+    for (const auto &data : buckets_)
+      submit_bucket(handle, transa, transb, m, alpha, lda, beta, ldc, stream,
+                    data);
+  }
+
+  std::shared_ptr<graph_exec_entry>
+  build_graph(hipblasOperation_t transa, hipblasOperation_t transb, int m,
+              double alpha, int lda, double beta, int ldc,
+              hipStream_t caller_stream) {
+    const int lanes = std::min(dgemm_graph_lane_limit(), bucket_count());
+    std::vector<int> order(bucket_count());
+    for (int i = 0; i < bucket_count(); ++i)
+      order[i] = i;
+    std::stable_sort(order.begin(), order.end(), [&](int left, int right) {
+      const auto &lhs = buckets_[left];
+      const auto &rhs = buckets_[right];
+      return static_cast<uint64_t>(lhs.count) * lhs.shape.n * lhs.shape.k >
+             static_cast<uint64_t>(rhs.count) * rhs.shape.n * rhs.shape.k;
+    });
+
+    std::vector<std::vector<int>> lane_buckets(lanes);
+    std::vector<uint64_t> lane_work(lanes, 0);
+    for (int index : order) {
+      const int lane = static_cast<int>(
+          std::min_element(lane_work.begin(), lane_work.end()) -
+          lane_work.begin());
+      lane_buckets[lane].push_back(index);
+      const auto &data = buckets_[index];
+      lane_work[lane] +=
+          static_cast<uint64_t>(data.count) * data.shape.n * data.shape.k;
+    }
+
+    HIC_CHECK(hipStreamSynchronize(caller_stream));
+    int device;
+    HIC_CHECK(hipGetDevice(&device));
+    std::vector<hipStream_t> lane_streams(lanes);
+    std::vector<std::unique_ptr<hipblas_handle_owner>> lane_handles;
+    lane_handles.reserve(lanes);
+    for (int lane = 0; lane < lanes; ++lane) {
+      HIC_CHECK(hipStreamCreate(&lane_streams[lane]));
+      lane_handles.emplace_back(std::make_unique<hipblas_handle_owner>(device));
+      submit_bucket(lane_handles[lane]->get(), transa, transb, m, alpha, lda,
+                    beta, ldc, lane_streams[lane],
+                    buckets_[lane_buckets[lane].front()]);
+      HIC_CHECK(hipStreamSynchronize(lane_streams[lane]));
+    }
+
+    hipEvent_t fork_event;
+    HIC_CHECK(hipEventCreateWithFlags(&fork_event, hipEventDisableTiming));
+    std::vector<hipEvent_t> completion_events(lanes - 1);
+    for (hipEvent_t &event : completion_events)
+      HIC_CHECK(hipEventCreateWithFlags(&event, hipEventDisableTiming));
+
+    HIC_CHECK(hipStreamBeginCapture(lane_streams[0],
+                                    hipStreamCaptureModeGlobal));
+    HIC_CHECK(hipEventRecord(fork_event, lane_streams[0]));
+    for (int lane = 1; lane < lanes; ++lane)
+      HIC_CHECK(hipStreamWaitEvent(lane_streams[lane], fork_event, 0));
+    for (int lane = 0; lane < lanes; ++lane)
+      for (int index : lane_buckets[lane])
+        submit_bucket(lane_handles[lane]->get(), transa, transb, m, alpha,
+                      lda, beta, ldc, lane_streams[lane], buckets_[index]);
+    for (int lane = 1; lane < lanes; ++lane) {
+      HIC_CHECK(hipEventRecord(completion_events[lane - 1],
+                               lane_streams[lane]));
+      HIC_CHECK(hipStreamWaitEvent(lane_streams[0],
+                                   completion_events[lane - 1], 0));
+    }
+
+    hipGraph_t graph_raw;
+    HIC_CHECK(hipStreamEndCapture(lane_streams[0], &graph_raw));
+    hic_graph_owner captured_graph{graph_raw};
+    hipGraphExec_t instance;
+    HIC_CHECK(hipGraphInstantiate(&instance, captured_graph.get(), nullptr,
+                                  nullptr, 0));
+
+    lane_handles.clear();
+    HIC_CHECK(hipEventDestroy(fork_event));
+    for (hipEvent_t event : completion_events)
+      HIC_CHECK(hipEventDestroy(event));
+    for (hipStream_t lane_stream : lane_streams)
+      HIC_CHECK(hipStreamDestroy(lane_stream));
+    captured_graph.reset();
+
+    if (graph_debug_enabled()) {
+      const auto limits =
+          std::minmax_element(lane_work.begin(), lane_work.end());
+      std::fprintf(stderr,
+                   "EC_DGEMM_BUCKETED event=graph_build rank=%s buckets=%d "
+                   "lanes=%d lane_work_min=%" PRIu64
+                   " lane_work_max=%" PRIu64 "\n",
+                   graph_debug_rank(), bucket_count(), lanes, *limits.first,
+                   *limits.second);
+      std::fflush(stderr);
+    }
+    return std::make_shared<graph_exec_entry>(instance);
+  }
+
   int device_ = 0;
   int active_groups_ = 0;
   int largest_bucket_ = 0;
   std::vector<bucket> buckets_;
+  std::mutex graph_mutex_;
+  std::shared_ptr<graph_exec_entry> graph_;
 };
 
 struct dgemm_bucketed_cache_state {
@@ -1333,7 +1479,7 @@ void hipblas_dgemm_wrapper_grouped(int resol_id, int blas_id, char transa,
   }
 #endif
 
-  if (dgemm_bucketed_enabled() &&
+  if (dgemm_bucketed_enabled() && dgemm_bucketed_selected(blas_id) &&
       dgemm_bucketed_profitable(m, n, k, ldc, offsetsC, batchCount)) {
     const auto key = make_cache_key(
         resol_id, blas_id, static_cast<int>(op_t1), static_cast<int>(op_t2), m,
