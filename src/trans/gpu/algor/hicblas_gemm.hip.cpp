@@ -21,6 +21,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <tuple>
 #include <type_traits>
 #include <unordered_map>
 #include <unistd.h>
@@ -62,6 +63,14 @@ bool graph_debug_force_group() {
 bool graph_debug_force_sync_async() {
   static const bool enabled = [] {
     const char *value = std::getenv("ECTRANS_GEMM_DEBUG_SYNC_ASYNC");
+    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+  }();
+  return enabled;
+}
+
+bool dgemm_bucketed_enabled() {
+  static const bool enabled = [] {
+    const char *value = std::getenv("ECTRANS_GPU_DGEMM_BUCKETED");
     return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
   }();
   return enabled;
@@ -712,6 +721,201 @@ private:
   hipblasOperation_t transa_, transb_;
 };
 
+struct dgemm_bucket_shape {
+  int n;
+  int k;
+  int ldb;
+
+  bool operator<(const dgemm_bucket_shape &other) const {
+    return std::tie(n, k, ldb) < std::tie(other.n, other.k, other.ldb);
+  }
+};
+
+class dgemm_bucketed_entry {
+public:
+  dgemm_bucketed_entry(int device, const double *A,
+                       const int64_t *offsetsA, const double *B,
+                       const int *n, const int *k, const int *ldb,
+                       const int64_t *offsetsB, double *C,
+                       const int64_t *offsetsC, int batchCount)
+      : device_(device) {
+    std::map<dgemm_bucket_shape, std::vector<int>> groups;
+    for (int i = 0; i < batchCount; ++i) {
+      if (n[i] > 0 && k[i] > 0)
+        groups[{n[i], k[i], ldb[i]}].push_back(i);
+    }
+
+    buckets_.reserve(groups.size());
+    for (const auto &item : groups) {
+      bucket data;
+      data.shape = item.first;
+      data.count = static_cast<int>(item.second.size());
+      std::vector<const double *> hostA(data.count);
+      std::vector<const double *> hostB(data.count);
+      std::vector<double *> hostC(data.count);
+      for (int j = 0; j < data.count; ++j) {
+        const int index = item.second[j];
+        hostA[j] = A + offsetsA[index];
+        hostB[j] = B + offsetsB[index];
+        hostC[j] = C + offsetsC[index];
+      }
+      HIC_CHECK(hipMalloc(reinterpret_cast<void **>(&data.A),
+                          data.count * sizeof(*data.A)));
+      HIC_CHECK(hipMalloc(reinterpret_cast<void **>(&data.B),
+                          data.count * sizeof(*data.B)));
+      HIC_CHECK(hipMalloc(reinterpret_cast<void **>(&data.C),
+                          data.count * sizeof(*data.C)));
+      HIC_CHECK(hipMemcpy(data.A, hostA.data(), data.count * sizeof(*data.A),
+                          hipMemcpyHostToDevice));
+      HIC_CHECK(hipMemcpy(data.B, hostB.data(), data.count * sizeof(*data.B),
+                          hipMemcpyHostToDevice));
+      HIC_CHECK(hipMemcpy(data.C, hostC.data(), data.count * sizeof(*data.C),
+                          hipMemcpyHostToDevice));
+      active_groups_ += data.count;
+      largest_bucket_ = std::max(largest_bucket_, data.count);
+      buckets_.push_back(data);
+    }
+  }
+
+  ~dgemm_bucketed_entry() {
+    int current_device;
+    HIC_CHECK(hipGetDevice(&current_device));
+    if (current_device != device_)
+      HIC_CHECK(hipSetDevice(device_));
+    for (auto &data : buckets_) {
+      HIC_CHECK(hipFree(data.A));
+      HIC_CHECK(hipFree(data.B));
+      HIC_CHECK(hipFree(data.C));
+    }
+    if (current_device != device_)
+      HIC_CHECK(hipSetDevice(current_device));
+  }
+
+  dgemm_bucketed_entry(const dgemm_bucketed_entry &) = delete;
+  dgemm_bucketed_entry &operator=(const dgemm_bucketed_entry &) = delete;
+
+  void run(hipblasOperation_t transa, hipblasOperation_t transb, int m,
+           double alpha, int lda, double beta, int ldc, hipStream_t stream) {
+    hipblasHandle_t handle = get_hipblas_handle();
+    HICBLAS_CHECK(hipblasSetStream(handle, stream));
+    for (const auto &data : buckets_) {
+      HICBLAS_CHECK(hipblasDgemmBatched(
+          handle, transa, transb, m, data.shape.n, data.shape.k, &alpha,
+          data.A, lda, data.B, data.shape.ldb, &beta, data.C, ldc,
+          data.count));
+    }
+  }
+
+  int bucket_count() const { return static_cast<int>(buckets_.size()); }
+  int active_groups() const { return active_groups_; }
+  int largest_bucket() const { return largest_bucket_; }
+
+private:
+  struct bucket {
+    dgemm_bucket_shape shape{};
+    int count = 0;
+    const double **A = nullptr;
+    const double **B = nullptr;
+    double **C = nullptr;
+  };
+
+  int device_ = 0;
+  int active_groups_ = 0;
+  int largest_bucket_ = 0;
+  std::vector<bucket> buckets_;
+};
+
+struct dgemm_bucketed_cache_state {
+  std::mutex mutex;
+  std::unordered_map<cache_key<double>, std::shared_ptr<dgemm_bucketed_entry>,
+                     cache_key_hash<double>>
+      entries;
+};
+
+dgemm_bucketed_cache_state &get_dgemm_bucketed_cache_state() {
+  static dgemm_bucketed_cache_state state;
+  return state;
+}
+
+void free_dgemm_bucketed_cache(void *, size_t) {
+  auto &state = get_dgemm_bucketed_cache_state();
+  std::lock_guard<std::mutex> lock(state.mutex);
+  state.entries.clear();
+}
+
+void erase_dgemm_bucketed_cache(int resol_id) {
+  auto &state = get_dgemm_bucketed_cache_state();
+  std::lock_guard<std::mutex> lock(state.mutex);
+  erase_resol_from_cache(state.entries, resol_id);
+}
+
+bool dgemm_bucketed_profitable(int m, const int *n, const int *k, int ldc,
+                               const int64_t *offsetsC, int batchCount) {
+  if (m <= 0 || batchCount < 8)
+    return false;
+  std::vector<std::pair<int64_t, int64_t>> ranges;
+  ranges.reserve(batchCount);
+  for (int i = 0; i < batchCount; ++i) {
+    if (n[i] <= 0 || k[i] <= 0)
+      continue;
+    ranges.emplace_back(offsetsC[i], offsetsC[i] +
+                                         static_cast<int64_t>(n[i] - 1) * ldc +
+                                         m);
+  }
+  if (ranges.size() < 8)
+    return false;
+  std::sort(ranges.begin(), ranges.end());
+  for (std::size_t i = 1; i < ranges.size(); ++i)
+    if (ranges[i].first < ranges[i - 1].second)
+      return false;
+  return true;
+}
+
+void run_dgemm_bucketed(
+    hipblasOperation_t transa, hipblasOperation_t transb,
+    const cache_key<double> &key, int m, const int *n, const int *k,
+    double alpha, const double *A, int lda, const int64_t *offsetsA,
+    const double *B, const int *ldb, const int64_t *offsetsB, double beta,
+    double *C, int ldc, const int64_t *offsetsC, int batchCount,
+    hipStream_t stream, void *growing_allocator, bool synchronize) {
+  {
+    std::lock_guard<std::mutex> registration_lock(
+        growing_allocator_registration_mutex);
+    growing_allocator_register_free_c(growing_allocator,
+                                      free_dgemm_bucketed_cache);
+  }
+
+  auto &state = get_dgemm_bucketed_cache_state();
+  std::shared_ptr<dgemm_bucketed_entry> entry;
+  bool cache_miss = false;
+  {
+    std::lock_guard<std::mutex> lock(state.mutex);
+    auto found = state.entries.find(key);
+    cache_miss = found == state.entries.end();
+    if (cache_miss) {
+      entry = std::make_shared<dgemm_bucketed_entry>(
+          key.device_id, A, offsetsA, B, n, k, ldb, offsetsB, C, offsetsC,
+          batchCount);
+      state.entries.emplace(key, entry);
+    } else {
+      entry = found->second;
+    }
+  }
+
+  if (graph_debug_enabled() && cache_miss) {
+    std::fprintf(stderr,
+                 "EC_DGEMM_BUCKETED event=build rank=%s resol=%d blas=%d "
+                 "groups=%d buckets=%d largest=%d\n",
+                 graph_debug_rank(), key.resol_id, key.blas_id,
+                 entry->active_groups(), entry->bucket_count(),
+                 entry->largest_bucket());
+    std::fflush(stderr);
+  }
+  entry->run(transa, transb, m, alpha, lda, beta, ldc, stream);
+  if (synchronize)
+    HIC_CHECK(hipStreamSynchronize(stream));
+}
+
 int dgemm_graph_lane_limit() {
   static const int lanes = [] {
     const char *value = std::getenv("ECTRANS_GEMM_GRAPH_LANES");
@@ -1025,6 +1229,18 @@ void hipblas_dgemm_wrapper_grouped(int resol_id, int blas_id, char transa,
   }
 #endif
 
+  if (dgemm_bucketed_enabled() &&
+      dgemm_bucketed_profitable(m, n, k, ldc, offsetsC, batchCount)) {
+    const auto key = make_cache_key(
+        resol_id, blas_id, static_cast<int>(op_t1), static_cast<int>(op_t2), m,
+        n, k, alpha, A, lda, offsetsA, B, ldb, offsetsB, beta, C, ldc,
+        offsetsC, batchCount);
+    run_dgemm_bucketed(op_t1, op_t2, key, m, n, k, alpha, A, lda, offsetsA, B,
+                       ldb, offsetsB, beta, C, ldc, offsetsC, batchCount,
+                       stream, growing_allocator, synchronize);
+    return;
+  }
+
 #ifdef USE_GRAPHS_GEMM
   const auto key = make_cache_key(
       resol_id, blas_id, static_cast<int>(op_t1), static_cast<int>(op_t2), m, n,
@@ -1228,6 +1444,7 @@ void hipblas_dgemm_wrapper_grouped_ordered_async(
 void clean_gemm(int resol_id) {
   erase_from_caches<hipblas_gemm_grouped<float>>(resol_id);
   erase_from_caches<hipblas_gemm_grouped<double>>(resol_id);
+  erase_dgemm_bucketed_cache(resol_id);
 #ifdef USE_CUTLASS
   erase_from_caches<detail::cutlass_sgemm_grouped<
       detail::CutlassType::cutlass_3xtf32, CUBLAS_OP_T, CUBLAS_OP_T>>(resol_id);
