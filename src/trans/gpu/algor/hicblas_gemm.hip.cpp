@@ -1247,6 +1247,7 @@ void run_dgemm_graph_dag(
     HIC_CHECK(hipGetDevice(&device));
     std::vector<hipStream_t> laneStreams(lanes);
     std::vector<std::unique_ptr<hipblas_handle_owner>> laneHandles;
+    std::vector<double *> laneWarmupOutputs(lanes, nullptr);
     laneHandles.reserve(lanes);
     double streamCreateMs = 0.0;
     double handleCreateMs = 0.0;
@@ -1268,11 +1269,15 @@ void run_dgemm_graph_dag(
       const auto handleCreateEnd =
           debug ? graph_debug_clock::now() : graph_debug_clock::time_point{};
       const int warmupIndex = laneGroups[lane].front();
+      const std::size_t warmupElements =
+          static_cast<std::size_t>(m) * n[warmupIndex];
+      HIC_CHECK(hipMalloc(reinterpret_cast<void **>(&laneWarmupOutputs[lane]),
+                          warmupElements * sizeof(double)));
       submit_hipblas_dgemm(
           laneHandles[lane]->get(), transa, transb, laneStreams[lane], m,
           n[warmupIndex], k[warmupIndex], alpha, A + offsetsA[warmupIndex], lda,
-          B + offsetsB[warmupIndex], ldb[warmupIndex], beta,
-          C + offsetsC[warmupIndex], ldc);
+          B + offsetsB[warmupIndex], ldb[warmupIndex], 0.0,
+          laneWarmupOutputs[lane], m);
       const auto warmupEnqueueEnd =
           debug ? graph_debug_clock::now() : graph_debug_clock::time_point{};
       HIC_CHECK(hipStreamSynchronize(laneStreams[lane]));
@@ -1286,6 +1291,8 @@ void run_dgemm_graph_dag(
         warmupSyncMs += graph_debug_ms(warmupEnqueueEnd, warmupSyncEnd);
       }
     }
+    for (double *output : laneWarmupOutputs)
+      HIC_CHECK(hipFree(output));
 
     const auto eventCreateStart =
         debug ? graph_debug_clock::now() : graph_debug_clock::time_point{};
