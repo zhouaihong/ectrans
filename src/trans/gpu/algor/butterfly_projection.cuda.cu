@@ -17,8 +17,9 @@ constexpr int fields_per_block = 16;
 constexpr int outputs_per_block = 8;
 constexpr int gemm_tile = 16;
 constexpr int warp_threads = 32;
-constexpr int wmma_field_tile = 64;
-constexpr int wmma_warps_per_block = 16;
+constexpr int wmma_field_tile = 24;
+constexpr int wmma_field_warps = wmma_field_tile / 8;
+constexpr int wmma_warps_per_block = 2 * wmma_field_warps;
 constexpr int warp_small_warps_per_block = 8;
 constexpr int fused_leaf_field_tile = wmma_field_tile;
 
@@ -171,8 +172,8 @@ __global__ void butterfly_grouped_gemm_kernel(
   const std::int64_t factor_offset = factor_offsets[group];
 
   const int warp = thread / warp_threads;
-  const int warp_row = (warp & 7) * 8;
-  const int warp_column = (warp >> 3) * 8;
+  const int warp_row = (warp % wmma_field_warps) * 8;
+  const int warp_column = (warp / wmma_field_warps) * 8;
   for (int field_base = 0; field_base < leading_dimension;
        field_base += wmma_field_tile) {
     for (int column_base = 0; column_base < n; column_base += gemm_tile) {
@@ -278,8 +279,8 @@ __global__ void butterfly_compact_projection_kernel(
     return;
 
   const int warp = thread / warp_threads;
-  const int warp_row = (warp & 7) * 8;
-  const int warp_column = (warp >> 3) * 8;
+  const int warp_row = (warp % wmma_field_warps) * 8;
+  const int warp_column = (warp / wmma_field_warps) * 8;
   const std::int64_t pivot_offset = pivot_offsets[group];
   const std::int64_t factor_offset = factor_offsets[group];
   for (int field_base = 0; field_base < leading_dimension;
@@ -538,8 +539,8 @@ __global__ void butterfly_fused_leaf_direct_kernel(
       projection_factor_offsets[group];
   const std::int64_t pivot_offset = pivot_offsets[group];
   const int warp = thread / warp_threads;
-  const int warp_row = (warp & 7) * 8;
-  const int warp_column = (warp >> 3) * 8;
+  const int warp_row = (warp % wmma_field_warps) * 8;
+  const int warp_column = (warp / wmma_field_warps) * 8;
 
   for (int field_base = 0; field_base < leading_dimension;
        field_base += fused_leaf_field_tile) {
