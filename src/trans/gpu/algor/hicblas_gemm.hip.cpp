@@ -71,7 +71,7 @@ bool graph_debug_force_sync_async() {
 bool dgemm_bucketed_enabled() {
   static const bool enabled = [] {
     const char *value = std::getenv("ECTRANS_GPU_DGEMM_BUCKETED");
-    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+    return value == nullptr || value[0] == '\0' || std::strcmp(value, "0") != 0;
   }();
   return enabled;
 }
@@ -79,7 +79,7 @@ bool dgemm_bucketed_enabled() {
 bool dgemm_bucketed_graph_enabled() {
   static const bool enabled = [] {
     const char *value = std::getenv("ECTRANS_GPU_DGEMM_BUCKETED_GRAPH");
-    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+    return value == nullptr || value[0] == '\0' || std::strcmp(value, "0") != 0;
   }();
   return enabled;
 }
@@ -91,19 +91,22 @@ bool dgemm_bucketed_selected(int blas_id) {
       return 1;
     if (value != nullptr && std::strcmp(value, "direct") == 0)
       return 2;
-    return 0;
+    if (value != nullptr && std::strcmp(value, "all") == 0)
+      return 0;
+    return 3;
   }();
   if (scope == 1)
     return blas_id == 11 || blas_id == 12;
   if (scope == 2)
     return blas_id == 21 || blas_id == 22;
-  return true;
+  return scope == 0 || blas_id == 11 || blas_id == 12 || blas_id == 21 ||
+                           blas_id == 22;
 }
 
 bool dgemm_align8_enabled() {
   static const bool enabled = [] {
     const char *value = std::getenv("ECTRANS_GPU_DGEMM_ALIGN8");
-    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+    return value == nullptr || value[0] == '\0' || std::strcmp(value, "0") != 0;
   }();
   return enabled;
 }
