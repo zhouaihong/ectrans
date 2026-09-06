@@ -29,6 +29,11 @@ bool warp_small_requested() {
   return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
 }
 
+bool grid_tiled_requested() {
+  const char *value = std::getenv("ECTRANS_GPU_BUTTERFLY_GRID_TILED");
+  return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+}
+
 int warp_small_limit() {
   const char *value = std::getenv("ECTRANS_GPU_BUTTERFLY_WARP_SMALL_LIMIT");
   if (value == nullptr || value[0] == '\0')
@@ -175,9 +180,22 @@ __global__ void butterfly_grouped_gemm_kernel(
   const int warp = thread / warp_threads;
   const int warp_row = (warp % wmma_field_warps) * 8;
   const int warp_column = (warp / wmma_field_warps) * 8;
-  for (int field_base = 0; field_base < leading_dimension;
+  const bool grid_tiled = gridDim.x > 1 || gridDim.y > 1;
+  const int first_field =
+      grid_tiled ? static_cast<int>(blockIdx.x) * wmma_field_tile : 0;
+  const int last_field = grid_tiled ? first_field + wmma_field_tile
+                                    : leading_dimension;
+  const int first_column =
+      grid_tiled ? static_cast<int>(blockIdx.y) * gemm_tile : 0;
+  const int last_column = grid_tiled ? first_column + gemm_tile : n;
+
+  for (int field_base = first_field;
+       field_base < leading_dimension && field_base < last_field;
        field_base += wmma_field_tile) {
-    for (int column_base = 0; column_base < n; column_base += gemm_tile) {
+    for (int column_base = first_column;
+         column_base < n && column_base < last_column;
+         column_base += gemm_tile) {
+
       nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 8, 8, 4, double,
                              nvcuda::wmma::col_major>
           a_fragment;
@@ -288,9 +306,22 @@ __global__ void butterfly_compact_projection_kernel(
   const int warp_column = (warp / wmma_field_warps) * 8;
   const std::int64_t pivot_offset = pivot_offsets[group];
   const std::int64_t factor_offset = factor_offsets[group];
-  for (int field_base = 0; field_base < leading_dimension;
+  const bool grid_tiled = gridDim.x > 1 || gridDim.y > 1;
+  const int first_field =
+      grid_tiled ? static_cast<int>(blockIdx.x) * wmma_field_tile : 0;
+  const int last_field = grid_tiled ? first_field + wmma_field_tile
+                                    : leading_dimension;
+  const int first_column =
+      grid_tiled ? static_cast<int>(blockIdx.y) * gemm_tile : 0;
+  const int last_column = grid_tiled ? first_column + gemm_tile : n;
+
+  for (int field_base = first_field;
+       field_base < leading_dimension && field_base < last_field;
        field_base += wmma_field_tile) {
-    for (int column_base = 0; column_base < n; column_base += gemm_tile) {
+    for (int column_base = first_column;
+         column_base < n && column_base < last_column;
+         column_base += gemm_tile) {
+
       nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 8, 8, 4, double,
                              nvcuda::wmma::col_major>
           a_fragment;
@@ -388,15 +419,25 @@ void launch_grouped_gemm(
   const dim3 warp_block(warp_small_warps_per_block * warp_threads);
   const auto stream = reinterpret_cast<cudaStream_t>(stream_value);
   const int limit = warp_small_requested() ? warp_small_limit() : 0;
+  const bool grid_tiled = grid_tiled_requested();
   constexpr int max_grid_z = 65535;
   for (int group_base = 0; group_base < group_count;
        group_base += max_grid_z) {
     const int groups =
         group_count - group_base < max_grid_z ? group_count - group_base
                                                : max_grid_z;
-    const dim3 grid(1, 1, static_cast<unsigned int>(groups));
+    const dim3 warp_grid(1, 1, static_cast<unsigned int>(groups));
+    const dim3 grid(
+        grid_tiled ? static_cast<unsigned int>(
+                         (leading_dimension + wmma_field_tile - 1) /
+                         wmma_field_tile)
+                   : 1u,
+        grid_tiled ? static_cast<unsigned int>((max_outputs + gemm_tile - 1) /
+                                               gemm_tile)
+                   : 1u,
+        static_cast<unsigned int>(groups));
     if (limit > 0) {
-      butterfly_warp_small_gemm_kernel<<<grid, warp_block, 0, stream>>>(
+      butterfly_warp_small_gemm_kernel<<<warp_grid, warp_block, 0, stream>>>(
           input, factors, output, leading_dimension, outputs, inner, factor_ld,
           src, dst, factor_offsets, add_src, add_dst, group_base,
           factor_transposed, atomic_output, compact_projection, beta, limit);
@@ -423,15 +464,26 @@ void launch_compact_projection(
   const dim3 warp_block(warp_small_warps_per_block * warp_threads);
   const auto stream = reinterpret_cast<cudaStream_t>(stream_value);
   const int limit = warp_small_requested() ? warp_small_limit() : 0;
+  const bool grid_tiled = grid_tiled_requested();
   constexpr int max_grid_z = 65535;
   for (int group_base = 0; group_base < group_count;
        group_base += max_grid_z) {
     const int groups =
         group_count - group_base < max_grid_z ? group_count - group_base
                                                : max_grid_z;
-    const dim3 grid(1, 1, static_cast<unsigned int>(groups));
+    const dim3 warp_grid(1, 1, static_cast<unsigned int>(groups));
+    const dim3 grid(
+        grid_tiled ? static_cast<unsigned int>(
+                         (leading_dimension + wmma_field_tile - 1) /
+                         wmma_field_tile)
+                   : 1u,
+        grid_tiled ? static_cast<unsigned int>((max_rank + gemm_tile - 1) /
+                                               gemm_tile)
+                   : 1u,
+        static_cast<unsigned int>(groups));
     if (limit > 0) {
-      butterfly_warp_small_projection_kernel<<<grid, warp_block, 0, stream>>>(
+      butterfly_warp_small_projection_kernel<<<warp_grid, warp_block, 0,
+                                                stream>>>(
           input, factors, output, leading_dimension, ranks, columns, src, dst,
           pivot_offsets, factor_offsets, pivots, add_src, add_dst, group_base,
           beta, limit);
