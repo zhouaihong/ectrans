@@ -457,6 +457,16 @@ ENDIF
 ! First part of setup of distributed environment
 CALL SUMP_TRANS_PRELEG
 
+#ifdef ACCGPU
+! Select the rank's device before building device-resident butterfly plans.
+IF (.NOT.D%LGRIDONLY) THEN
+  IDEVTYPE = ACC_GET_DEVICE_TYPE()
+  INUMDEVS = ACC_GET_NUM_DEVICES(IDEVTYPE)
+  MYGPU = MOD(MYPROC-1, INUMDEVS)
+  CALL ACC_SET_DEVICE_NUM(MYGPU, IDEVTYPE)
+ENDIF
+#endif
+
 IF( .NOT.LLSPSETUPONLY ) THEN
 
   ! Compute Legendre polonomial and Gaussian Latitudes and Weights
@@ -483,13 +493,6 @@ IF (LHOOK) CALL DR_HOOK('SETUP_TRANS',1,ZHOOK_HANDLE)
 
 
 IF( .NOT.D%LGRIDONLY ) THEN
-
-#ifdef ACCGPU
-  IDEVTYPE = ACC_GET_DEVICE_TYPE()
-  INUMDEVS = ACC_GET_NUM_DEVICES(IDEVTYPE)
-  MYGPU = MOD(MYPROC-1, INUMDEVS)
-  CALL ACC_SET_DEVICE_NUM(MYGPU, IDEVTYPE)
-#endif
 
   WRITE(NOUT,*) 'R%NTMAX=',R%NTMAX
   WRITE(NOUT,*) 'R%NSMAX=',R%NSMAX
