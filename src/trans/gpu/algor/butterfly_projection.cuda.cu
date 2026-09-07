@@ -39,8 +39,9 @@ int fused_leaf_field_tile_requested() {
   if (value == nullptr || value[0] == '\0')
     return wmma_field_tile;
   const int parsed = std::atoi(value);
-  return parsed == 32 || parsed == 64 || parsed == 128 ? parsed
-                                                       : wmma_field_tile;
+  return parsed == 32 || parsed == 64 || parsed == 104 || parsed == 128
+             ? parsed
+             : wmma_field_tile;
 }
 
 int warp_small_limit() {
@@ -1099,6 +1100,12 @@ extern "C" void ectrans_butterfly_fused_leaf_direct_cuda(
         max_rank, stream_value);
   } else if (field_tile == 64) {
     launch_fused_leaf_direct<64>(
+        input, factors, output, leading_dimension, rows, ranks, columns,
+        input_columns, output_columns, final_factor_offsets,
+        projection_factor_offsets, pivot_offsets, pivots, group_count,
+        max_rank, stream_value);
+  } else if (field_tile == 104) {
+    launch_fused_leaf_direct<104>(
         input, factors, output, leading_dimension, rows, ranks, columns,
         input_columns, output_columns, final_factor_offsets,
         projection_factor_offsets, pivot_offsets, pivots, group_count,
