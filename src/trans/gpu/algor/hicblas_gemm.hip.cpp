@@ -1201,10 +1201,9 @@ void run_dgemm_graph_dag(
       active.push_back(i);
   const int lanes = std::min(dgemm_graph_lane_limit(),
                              static_cast<int>(active.size()));
-  if (lanes <= 1) {
-    run_group_graph(gemm_type(transa, transb), key, m, n, k, alpha, A, lda,
-                    offsetsA, B, ldb, offsetsB, beta, C, ldc, offsetsC,
-                    batchCount, stream, growing_allocator, synchronize);
+  if (active.empty()) {
+    if (synchronize)
+      HIC_CHECK(hipStreamSynchronize(stream));
     return;
   }
 
