@@ -22,7 +22,6 @@ constexpr int wmma_field_tile = 128;
 constexpr int wmma_field_warps = wmma_field_tile / 8;
 constexpr int wmma_warps_per_block = 2 * wmma_field_warps;
 constexpr int warp_small_warps_per_block = 8;
-constexpr int fused_leaf_field_tile = wmma_field_tile;
 
 bool warp_small_requested() {
   const char *value = std::getenv("ECTRANS_GPU_BUTTERFLY_WARP_SMALL");
@@ -32,6 +31,16 @@ bool warp_small_requested() {
 bool grid_tiled_requested() {
   const char *value = std::getenv("ECTRANS_GPU_BUTTERFLY_GRID_TILED");
   return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+}
+
+int fused_leaf_field_tile_requested() {
+  const char *value =
+      std::getenv("ECTRANS_GPU_BUTTERFLY_FUSED_LEAF_FIELD_TILE");
+  if (value == nullptr || value[0] == '\0')
+    return wmma_field_tile;
+  const int parsed = std::atoi(value);
+  return parsed == 32 || parsed == 64 || parsed == 128 ? parsed
+                                                       : wmma_field_tile;
 }
 
 int warp_small_limit() {
@@ -751,6 +760,7 @@ __global__ void butterfly_projection_reverse_kernel(
   }
 }
 
+template <int field_tile>
 __global__ void butterfly_fused_leaf_direct_kernel(
     const double *__restrict__ input, const double *__restrict__ factors,
     double *__restrict__ output, int leading_dimension,
@@ -762,9 +772,9 @@ __global__ void butterfly_fused_leaf_direct_kernel(
     const std::int64_t *__restrict__ projection_factor_offsets,
     const std::int64_t *__restrict__ pivot_offsets,
     const int *__restrict__ pivots) {
-  __shared__ __align__(32) double tile_a[wmma_field_tile * wmma_k_tile];
+  __shared__ __align__(32) double tile_a[field_tile * wmma_k_tile];
   __shared__ __align__(32) double tile_b[wmma_k_tile * gemm_tile];
-  __shared__ __align__(32) double tile_c[wmma_field_tile * gemm_tile];
+  __shared__ __align__(32) double tile_c[field_tile * gemm_tile];
   extern __shared__ double beta[];
   const int group = static_cast<int>(blockIdx.x);
   const int thread = threadIdx.x;
@@ -779,11 +789,12 @@ __global__ void butterfly_fused_leaf_direct_kernel(
       projection_factor_offsets[group];
   const std::int64_t pivot_offset = pivot_offsets[group];
   const int warp = thread / warp_threads;
-  const int warp_row = (warp % wmma_field_warps) * 8;
-  const int warp_column = (warp / wmma_field_warps) * 8;
+  constexpr int field_warps = field_tile / 8;
+  const int warp_row = (warp % field_warps) * 8;
+  const int warp_column = (warp / field_warps) * 8;
 
   for (int field_base = 0; field_base < leading_dimension;
-       field_base += fused_leaf_field_tile) {
+       field_base += field_tile) {
     for (int rank_base = 0; rank_base < rank; rank_base += gemm_tile) {
       nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 8, 8, 4, double,
                              nvcuda::wmma::col_major>
@@ -796,10 +807,10 @@ __global__ void butterfly_fused_leaf_direct_kernel(
       nvcuda::wmma::fill_fragment(accumulator, 0.0);
 
       for (int k_base = 0; k_base < nonidentity; k_base += wmma_k_tile) {
-        for (int index = thread; index < wmma_field_tile * wmma_k_tile;
+        for (int index = thread; index < field_tile * wmma_k_tile;
              index += blockDim.x) {
-          const int field_lane = index % wmma_field_tile;
-          const int local_k = index / wmma_field_tile;
+          const int field_lane = index % field_tile;
+          const int local_k = index / field_tile;
           const int field = field_base + field_lane;
           const int global_k = k_base + local_k;
           tile_a[index] =
@@ -827,8 +838,8 @@ __global__ void butterfly_fused_leaf_direct_kernel(
              k_tile < wmma_k_tile && k_base + k_tile < nonidentity;
              k_tile += 4) {
           nvcuda::wmma::load_matrix_sync(
-              a_fragment, tile_a + warp_row + k_tile * wmma_field_tile,
-              wmma_field_tile);
+              a_fragment, tile_a + warp_row + k_tile * field_tile,
+              field_tile);
           nvcuda::wmma::load_matrix_sync(
               b_fragment, tile_b + k_tile + warp_column * wmma_k_tile,
               wmma_k_tile);
@@ -839,18 +850,18 @@ __global__ void butterfly_fused_leaf_direct_kernel(
       }
 
       nvcuda::wmma::store_matrix_sync(
-          tile_c + warp_row + warp_column * wmma_field_tile, accumulator,
-          wmma_field_tile, nvcuda::wmma::mem_col_major);
+          tile_c + warp_row + warp_column * field_tile, accumulator,
+          field_tile, nvcuda::wmma::mem_col_major);
       __syncthreads();
 
-      for (int index = thread; index < wmma_field_tile * gemm_tile;
+      for (int index = thread; index < field_tile * gemm_tile;
            index += blockDim.x) {
-        const int field_lane = index % wmma_field_tile;
-        const int local_rank = index / wmma_field_tile;
+        const int field_lane = index % field_tile;
+        const int local_rank = index / field_tile;
         const int field = field_base + field_lane;
         const int rank_index = rank_base + local_rank;
         if (field < leading_dimension && rank_index < rank) {
-          beta[rank_index * fused_leaf_field_tile + field_lane] =
+          beta[rank_index * field_tile + field_lane] =
               input[(input_column + pivots[pivot_offset + rank_index]) *
                         leading_dimension +
                     field] +
@@ -873,15 +884,15 @@ __global__ void butterfly_fused_leaf_direct_kernel(
       nvcuda::wmma::fill_fragment(accumulator, 0.0);
 
       for (int k_base = 0; k_base < rank; k_base += wmma_k_tile) {
-        for (int index = thread; index < wmma_field_tile * wmma_k_tile;
+        for (int index = thread; index < field_tile * wmma_k_tile;
              index += blockDim.x) {
-          const int field_lane = index % wmma_field_tile;
-          const int local_k = index / wmma_field_tile;
+          const int field_lane = index % field_tile;
+          const int local_k = index / field_tile;
           const int field = field_base + field_lane;
           const int rank_index = k_base + local_k;
           tile_a[index] =
               field < leading_dimension && rank_index < rank
-                  ? beta[rank_index * fused_leaf_field_tile + field_lane]
+                  ? beta[rank_index * field_tile + field_lane]
                   : 0.0;
         }
         for (int index = thread; index < wmma_k_tile * gemm_tile;
@@ -901,8 +912,8 @@ __global__ void butterfly_fused_leaf_direct_kernel(
         for (int k_tile = 0;
              k_tile < wmma_k_tile && k_base + k_tile < rank; k_tile += 4) {
           nvcuda::wmma::load_matrix_sync(
-              a_fragment, tile_a + warp_row + k_tile * wmma_field_tile,
-              wmma_field_tile);
+              a_fragment, tile_a + warp_row + k_tile * field_tile,
+              field_tile);
           nvcuda::wmma::load_matrix_sync(
               b_fragment, tile_b + k_tile + warp_column * wmma_k_tile,
               wmma_k_tile);
@@ -913,14 +924,14 @@ __global__ void butterfly_fused_leaf_direct_kernel(
       }
 
       nvcuda::wmma::store_matrix_sync(
-          tile_c + warp_row + warp_column * wmma_field_tile, accumulator,
-          wmma_field_tile, nvcuda::wmma::mem_col_major);
+          tile_c + warp_row + warp_column * field_tile, accumulator,
+          field_tile, nvcuda::wmma::mem_col_major);
       __syncthreads();
 
-      for (int index = thread; index < wmma_field_tile * gemm_tile;
+      for (int index = thread; index < field_tile * gemm_tile;
            index += blockDim.x) {
-        const int field_lane = index % wmma_field_tile;
-        const int local_row = index / wmma_field_tile;
+        const int field_lane = index % field_tile;
+        const int local_row = index / field_tile;
         const int field = field_base + field_lane;
         const int row = row_base + local_row;
         if (field < leading_dimension && row < row_count) {
@@ -932,6 +943,40 @@ __global__ void butterfly_fused_leaf_direct_kernel(
       __syncthreads();
     }
   }
+}
+
+template <int field_tile>
+void launch_fused_leaf_direct(
+    const double *input, const double *factors, double *output,
+    int leading_dimension, const int *rows, const int *ranks,
+    const int *columns, const std::int64_t *input_columns,
+    const std::int64_t *output_columns,
+    const std::int64_t *final_factor_offsets,
+    const std::int64_t *projection_factor_offsets,
+    const std::int64_t *pivot_offsets, const int *pivots, int group_count,
+    int max_rank, std::intptr_t stream_value) {
+  constexpr int field_warps = field_tile / 8;
+  const dim3 block(2 * field_warps * warp_threads);
+  const dim3 grid(static_cast<unsigned int>(group_count));
+  const std::size_t shared_bytes =
+      static_cast<std::size_t>(max_rank) * field_tile * sizeof(double);
+  const cudaError_t attribute_error = cudaFuncSetAttribute(
+      butterfly_fused_leaf_direct_kernel<field_tile>,
+      cudaFuncAttributeMaxDynamicSharedMemorySize,
+      static_cast<int>(shared_bytes));
+  if (attribute_error != cudaSuccess) {
+    std::fprintf(stderr,
+                 "butterfly fused leaf shared-memory request (%zu bytes) "
+                 "failed: %s\n",
+                 shared_bytes, cudaGetErrorString(attribute_error));
+    std::exit(EXIT_FAILURE);
+  }
+  const auto stream = reinterpret_cast<cudaStream_t>(stream_value);
+  butterfly_fused_leaf_direct_kernel<field_tile>
+      <<<grid, block, shared_bytes, stream>>>(
+          input, factors, output, leading_dimension, rows, ranks, columns,
+          input_columns, output_columns, final_factor_offsets,
+          projection_factor_offsets, pivot_offsets, pivots);
 }
 
 } // namespace
@@ -1045,27 +1090,26 @@ extern "C" void ectrans_butterfly_fused_leaf_direct_cuda(
     int max_rank, std::intptr_t stream_value) {
   if (leading_dimension <= 0 || group_count <= 0 || max_rank <= 0)
     return;
-  const dim3 block(wmma_warps_per_block * warp_threads);
-  const dim3 grid(static_cast<unsigned int>(group_count));
-  const std::size_t shared_bytes =
-      static_cast<std::size_t>(max_rank) * fused_leaf_field_tile *
-      sizeof(double);
-  const cudaError_t attribute_error = cudaFuncSetAttribute(
-      butterfly_fused_leaf_direct_kernel,
-      cudaFuncAttributeMaxDynamicSharedMemorySize,
-      static_cast<int>(shared_bytes));
-  if (attribute_error != cudaSuccess) {
-    std::fprintf(stderr,
-                 "butterfly fused leaf shared-memory request (%zu bytes) "
-                 "failed: %s\n",
-                 shared_bytes, cudaGetErrorString(attribute_error));
-    std::exit(EXIT_FAILURE);
+  const int field_tile = fused_leaf_field_tile_requested();
+  if (field_tile == 32) {
+    launch_fused_leaf_direct<32>(
+        input, factors, output, leading_dimension, rows, ranks, columns,
+        input_columns, output_columns, final_factor_offsets,
+        projection_factor_offsets, pivot_offsets, pivots, group_count,
+        max_rank, stream_value);
+  } else if (field_tile == 64) {
+    launch_fused_leaf_direct<64>(
+        input, factors, output, leading_dimension, rows, ranks, columns,
+        input_columns, output_columns, final_factor_offsets,
+        projection_factor_offsets, pivot_offsets, pivots, group_count,
+        max_rank, stream_value);
+  } else {
+    launch_fused_leaf_direct<128>(
+        input, factors, output, leading_dimension, rows, ranks, columns,
+        input_columns, output_columns, final_factor_offsets,
+        projection_factor_offsets, pivot_offsets, pivots, group_count,
+        max_rank, stream_value);
   }
-  const auto stream = reinterpret_cast<cudaStream_t>(stream_value);
-  butterfly_fused_leaf_direct_kernel<<<grid, block, shared_bytes, stream>>>(
-      input, factors, output, leading_dimension, rows, ranks, columns,
-      input_columns, output_columns, final_factor_offsets,
-      projection_factor_offsets, pivot_offsets, pivots);
   const cudaError_t error = cudaGetLastError();
   if (error != cudaSuccess) {
     std::fprintf(stderr, "butterfly fused leaf CUDA launch failed: %s\n",
